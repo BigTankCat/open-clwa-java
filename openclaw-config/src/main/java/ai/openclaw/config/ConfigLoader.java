@@ -26,7 +26,38 @@ public final class ConfigLoader {
   /**
    * Load config from the resolved config file. Returns empty object if file does not exist.
    */
+  /**
+   * Load config and resolve:
+   * - $include (recursive)
+   * - ${ENV} substitutions (with config.env overrides applied to env map)
+   */
   public ConfigSnapshot load() {
+    Path file = paths.getConfigFilePath();
+    if (!Files.isRegularFile(file)) {
+      return new ConfigSnapshot(null, Collections.emptyMap(), false);
+    }
+    try {
+      ConfigSnapshot raw = loadRaw();
+      @SuppressWarnings("unchecked")
+      Map<String, Object> resolved = raw.getConfig();
+
+      Map<String, String> env = buildEnvMap(resolved);
+      Object substituted =
+          ConfigEnvSubstitutor.substituteConfigEnvVars(resolved, env, (msg) -> System.err.println(msg));
+      @SuppressWarnings("unchecked")
+      Map<String, Object> substitutedMap = (Map<String, Object>) substituted;
+
+      return new ConfigSnapshot(file.toString(), substitutedMap, true);
+    } catch (Exception e) {
+      throw new ConfigLoadException("Failed to load config from " + file, e);
+    }
+  }
+
+  /**
+   * Load config after resolving $include, but without ${ENV} substitution.
+   * This snapshot is used to restore env var references during write-back.
+   */
+  public ConfigSnapshot loadRaw() {
     Path file = paths.getConfigFilePath();
     if (!Files.isRegularFile(file)) {
       return new ConfigSnapshot(null, Collections.emptyMap(), false);
@@ -38,36 +69,29 @@ public final class ConfigLoader {
           ? Collections.emptyMap()
           : MAPPER.convertValue(root, ConfigSnapshot.MAP_TYPE);
 
-      // 1) Resolve $include recursively.
       ConfigIncludes includes = new ConfigIncludes(MAPPER);
       Object withIncludes = includes.resolveIncludes(map, file);
 
-      // 2) Apply ${ENV} substitution.
       @SuppressWarnings("unchecked")
-      Map<String, Object> resolved = (Map<String, Object>) withIncludes;
-
-      Map<String, String> env = new HashMap<>(System.getenv());
-      // Apply config-defined env vars before substitution.
-      Object envObj = resolved.get("env");
-      if (envObj instanceof Map<?, ?> envMap) {
-        for (Map.Entry<?, ?> e : envMap.entrySet()) {
-          if (!(e.getKey() instanceof String k)) continue;
-          Object v = e.getValue();
-          if (v == null) continue;
-          env.put(k, String.valueOf(v));
-        }
-      }
-
-      Object substituted =
-          ConfigEnvSubstitutor.substituteConfigEnvVars(
-              resolved, env, (msg) -> System.err.println(msg));
-      @SuppressWarnings("unchecked")
-      Map<String, Object> substitutedMap = (Map<String, Object>) substituted;
-
-      return new ConfigSnapshot(file.toString(), substitutedMap, true);
+      Map<String, Object> rawMap = (Map<String, Object>) withIncludes;
+      return new ConfigSnapshot(file.toString(), rawMap, true);
     } catch (Exception e) {
-      throw new ConfigLoadException("Failed to load config from " + file, e);
+      throw new ConfigLoadException("Failed to load raw config from " + file, e);
     }
+  }
+
+  public static Map<String, String> buildEnvMap(Map<String, Object> config) {
+    Map<String, String> env = new HashMap<>(System.getenv());
+    Object envObj = config != null ? config.get("env") : null;
+    if (envObj instanceof Map<?, ?> envMap) {
+      for (Map.Entry<?, ?> e : envMap.entrySet()) {
+        if (!(e.getKey() instanceof String k)) continue;
+        Object v = e.getValue();
+        if (v == null) continue;
+        env.put(k, String.valueOf(v));
+      }
+    }
+    return env;
   }
 
   public ConfigPaths getPaths() {

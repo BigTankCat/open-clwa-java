@@ -6,6 +6,7 @@ import ai.openclaw.config.ConfigWriter;
 import ai.openclaw.config.ConfigParsers;
 import ai.openclaw.gateway.auth.MethodScopes;
 import ai.openclaw.config.ConfigMergePatch;
+import ai.openclaw.config.ConfigEnvRestorer;
 import ai.openclaw.protocol.EventFrame;
 import ai.openclaw.gateway.sessions.InMemorySessionStore;
 import ai.openclaw.protocol.ErrorCodes;
@@ -449,8 +450,8 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       return;
     }
 
-    ConfigSnapshot snapshot = configLoader.load();
-    if (!snapshot.isExists()) {
+    ConfigSnapshot resolvedSnapshot = configLoader.load();
+    if (!resolvedSnapshot.isExists()) {
       sendResponse(
           session,
           req.getId(),
@@ -459,6 +460,9 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
           ErrorShape.of(ErrorCodes.INVALID_REQUEST, "invalid config; fix before patching"));
       return;
     }
+
+    ConfigSnapshot rawSnapshot = configLoader.loadRaw();
+    Map<String, String> envForRestore = ConfigLoader.buildEnvMap(rawSnapshot.getConfig());
 
     Map<String, Object> patch;
     try {
@@ -473,8 +477,13 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       return;
     }
 
-    Map<String, Object> merged = ConfigMergePatch.merge(snapshot.getConfig(), patch);
-    configWriter.write(merged);
+    Map<String, Object> mergedResolved = ConfigMergePatch.merge(resolvedSnapshot.getConfig(), patch);
+    Object mergedRestored =
+        ConfigEnvRestorer.restoreEnvVarRefs(mergedResolved, rawSnapshot.getConfig(), envForRestore);
+
+    @SuppressWarnings("unchecked")
+    Map<String, Object> mergedToWrite = (Map<String, Object>) mergedRestored;
+    configWriter.write(mergedToWrite);
     Long delayMs = optionalNonNegativeLong(params, "restartDelayMs");
     Map<String, Object> restart = new LinkedHashMap<>();
     restart.put("reason", "config.patch");
