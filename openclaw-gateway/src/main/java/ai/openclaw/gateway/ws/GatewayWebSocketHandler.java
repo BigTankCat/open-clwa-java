@@ -94,6 +94,12 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
   private static final ConcurrentHashMap<String, Map<String, Object>> POLL_DEDUPE_BY_ID =
       new ConcurrentHashMap<>();
 
+  // node.pending.enqueue/node.pending.drain (status.request/location.request) work queue.
+  // Separated from node.invoke queue (node.pending.pull/ack) for parity.
+  private static final ConcurrentHashMap<String, ConcurrentLinkedQueue<PendingNodeDrainWork>>
+      NODE_DRAIN_WORK_BY_NODE_ID = new ConcurrentHashMap<>();
+  private static final AtomicLong NODE_DRAIN_REVISION = new AtomicLong(1);
+
   private static final class PendingNodeAction {
     final String id;
     final String command;
@@ -132,6 +138,23 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     }
   }
 
+  private static final class PendingNodeDrainWork {
+    final String id;
+    final String type;
+    final String priority;
+    final long createdAtMs;
+    final Long expiresAtMs;
+
+    PendingNodeDrainWork(
+        String id, String type, String priority, long createdAtMs, Long expiresAtMs) {
+      this.id = id;
+      this.type = type;
+      this.priority = priority;
+      this.createdAtMs = createdAtMs;
+      this.expiresAtMs = expiresAtMs;
+    }
+  }
+
   private final Map<String, WsMethodHandler> methodHandlers;
   private final ConfigWriter configWriter;
   private final InMemorySessionStore sessionStore;
@@ -163,10 +186,14 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
             (session, req, params) -> handleNodeInvokeResult(session, req, params),
             "node.event",
             (session, req, params) -> handleNodeEvent(session, req, params),
+            "node.pending.drain",
+            (session, req, params) -> handleNodePendingDrain(session, req, params),
             "node.pending.pull",
             (session, req, params) -> handleNodePendingPull(session, req, params),
             "node.pending.ack",
             (session, req, params) -> handleNodePendingAck(session, req, params),
+            "node.pending.enqueue",
+            (session, req, params) -> handleNodePendingEnqueue(session, req, params),
             "sessions.create",
             (session, req, params) -> handleSessionsCreate(session, req, params),
             "sessions.list",
@@ -320,8 +347,10 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
                     "node.invoke",
                     "node.invoke.result",
                     "node.event",
+                    "node.pending.drain",
                     "node.pending.pull",
                     "node.pending.ack",
+                    "node.pending.enqueue",
                     "status",
                     "connect"),
                 "events",
@@ -889,6 +918,123 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
   private void handleNodeEvent(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
     // Minimal no-op: just acknowledge.
     sendResponse(session, req.getId(), true, Map.of("ok", true), null);
+  }
+
+  private Map<String, Object> drainWorkItemPayload(PendingNodeDrainWork item) {
+    Map<String, Object> out = new LinkedHashMap<>();
+    out.put("id", item.id);
+    out.put("type", item.type);
+    out.put("priority", item.priority);
+    out.put("createdAtMs", item.createdAtMs);
+    out.put("expiresAtMs", item.expiresAtMs);
+    return out;
+  }
+
+  private void handleNodePendingDrain(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    WsContext ctx = (WsContext) session.getAttributes().get(WsContext.KEY);
+    String nodeId = ctx != null ? ctx.nodeId : null;
+    if (nodeId == null || nodeId.isBlank()) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "node.pending.drain: nodeId required in connect"));
+      return;
+    }
+
+    int maxItems = optionalPositiveInt(params, "maxItems", 10);
+    if (maxItems > 10) maxItems = 10;
+    if (maxItems < 1) maxItems = 1;
+
+    ConcurrentLinkedQueue<PendingNodeDrainWork> q = NODE_DRAIN_WORK_BY_NODE_ID.get(nodeId);
+    List<Map<String, Object>> items = new ArrayList<>();
+    if (q != null) {
+      for (int i = 0; i < maxItems; i++) {
+        PendingNodeDrainWork item = q.poll();
+        if (item == null) break;
+        items.add(drainWorkItemPayload(item));
+      }
+    }
+
+    // Parity with Node: includeDefaultStatus=true means we always return at least one item.
+    if (items.isEmpty()) {
+      long now = System.currentTimeMillis();
+      PendingNodeDrainWork defaultStatus =
+          new PendingNodeDrainWork(
+              UUID.randomUUID().toString(), "status.request", "default", now, null);
+      items.add(drainWorkItemPayload(defaultStatus));
+    }
+
+    boolean hasMore = q != null && !q.isEmpty();
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("nodeId", nodeId);
+    payload.put("revision", NODE_DRAIN_REVISION.get());
+    payload.put("items", items);
+    payload.put("hasMore", hasMore);
+    sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  private void handleNodePendingEnqueue(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String nodeId = optionalNonEmptyString(params, "nodeId");
+    String type = optionalNonEmptyString(params, "type");
+
+    if (nodeId == null || type == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "node.pending.enqueue: nodeId/type required"));
+      return;
+    }
+
+    boolean supportedType = "status.request".equals(type) || "location.request".equals(type);
+    if (!supportedType) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "node.pending.enqueue: unsupported type"));
+      return;
+    }
+
+    String priorityRaw = optionalNonEmptyString(params, "priority");
+    String priority = priorityRaw != null ? priorityRaw : "default";
+    if (!"default".equals(priority) && !"normal".equals(priority) && !"high".equals(priority)) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "node.pending.enqueue: invalid priority"));
+      return;
+    }
+
+    Long expiresInMs = optionalNonNegativeLong(params, "expiresInMs");
+    Boolean wakeObj = params != null && params.get("wake") instanceof Boolean b ? b : null;
+    boolean wake = wakeObj == null || wakeObj;
+
+    long now = System.currentTimeMillis();
+    Long expiresAtMs = expiresInMs != null ? now + expiresInMs : null;
+
+    PendingNodeDrainWork item =
+        new PendingNodeDrainWork(UUID.randomUUID().toString(), type, priority, now, expiresAtMs);
+    ConcurrentLinkedQueue<PendingNodeDrainWork> q =
+        NODE_DRAIN_WORK_BY_NODE_ID.computeIfAbsent(nodeId, (k) -> new ConcurrentLinkedQueue<>());
+    q.add(item);
+
+    long revision = NODE_DRAIN_REVISION.incrementAndGet();
+
+    // wakeTriggered: Node would try APNS wake; this Java slice doesn't integrate with wake.
+    Map<String, Object> queued = drainWorkItemPayload(item);
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("nodeId", nodeId);
+    payload.put("revision", revision);
+    payload.put("queued", queued);
+    payload.put("wakeTriggered", false);
+    sendResponse(session, req.getId(), true, payload, null);
   }
 
   private void handleNodePendingPull(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
