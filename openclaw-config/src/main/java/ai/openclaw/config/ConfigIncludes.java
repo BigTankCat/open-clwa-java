@@ -41,6 +41,10 @@ public final class ConfigIncludes {
 
   private final ObjectMapper json5Mapper;
 
+  // Prototype pollution guardrail parity with Node src/infra/prototype-keys.ts
+  private static final Set<String> BLOCKED_OBJECT_KEYS =
+      Set.of("__proto__", "prototype", "constructor");
+
   public ConfigIncludes(ObjectMapper json5Mapper) {
     this.json5Mapper = json5Mapper;
   }
@@ -246,6 +250,9 @@ public final class ConfigIncludes {
       Map<String, Object> sMap = castToStringObjectMap(sm);
       for (Map.Entry<String, Object> e : sMap.entrySet()) {
         String k = e.getKey();
+        if (BLOCKED_OBJECT_KEYS.contains(k)) {
+          continue;
+        }
         Object sv = e.getValue();
         if (out.containsKey(k)) {
           out.put(k, deepMerge(out.get(k), sv));

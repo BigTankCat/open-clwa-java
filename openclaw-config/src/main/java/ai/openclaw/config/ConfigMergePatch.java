@@ -16,6 +16,10 @@ public final class ConfigMergePatch {
 
   private ConfigMergePatch() {}
 
+  // Prototype pollution guardrail parity with Node src/infra/prototype-keys.ts
+  private static final java.util.Set<String> BLOCKED_OBJECT_KEYS =
+      java.util.Set.of("__proto__", "prototype", "constructor");
+
   @SuppressWarnings("unchecked")
   public static Map<String, Object> merge(
       Map<String, Object> base, Map<String, Object> patch) {
@@ -23,6 +27,9 @@ public final class ConfigMergePatch {
     if (patch == null) return out;
     for (Map.Entry<String, Object> entry : patch.entrySet()) {
       String key = entry.getKey();
+      if (BLOCKED_OBJECT_KEYS.contains(key)) {
+        continue;
+      }
       Object pv = entry.getValue();
       if (pv == null) {
         out.remove(key);

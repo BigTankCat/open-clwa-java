@@ -21,6 +21,10 @@ public final class ConfigEnvSubstitutor {
   private static final java.util.regex.Pattern VAR_NAME_PATTERN =
       java.util.regex.Pattern.compile("^[A-Z_][A-Z0-9_]*$");
 
+  // Prototype pollution guardrail parity with Node src/infra/prototype-keys.ts
+  private static final java.util.Set<String> BLOCKED_OBJECT_KEYS =
+      java.util.Set.of("__proto__", "prototype", "constructor");
+
   private ConfigEnvSubstitutor() {}
 
   public static List<String> substituteConfigEnvVars(Object obj, Map<String, String> env) {
@@ -51,6 +55,9 @@ public final class ConfigEnvSubstitutor {
       Map<String, Object> out = new HashMap<>();
       for (Map.Entry<?, ?> e : map.entrySet()) {
         if (!(e.getKey() instanceof String k)) continue;
+        if (BLOCKED_OBJECT_KEYS.contains(k)) {
+          continue;
+        }
         Object child = e.getValue();
         String childPath = path.isEmpty() ? k : path + "." + k;
         out.put(k, substituteAny(child, env, childPath, onMissing));
