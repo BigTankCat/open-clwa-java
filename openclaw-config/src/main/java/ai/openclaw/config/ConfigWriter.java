@@ -1,6 +1,7 @@
 package ai.openclaw.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.json5.Json5Factory;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -9,11 +10,11 @@ import java.util.Map;
 /**
  * Writes OpenClaw config back to {@code openclaw.json}.
  *
- * <p>This first slice writes plain JSON (no JSON5/include/env substitution).
+ * <p>Serialize as JSON5 for compatibility with config parsing.
  */
 public final class ConfigWriter {
 
-  private static final ObjectMapper MAPPER = new ObjectMapper();
+  private static final ObjectMapper MAPPER = new ObjectMapper(new Json5Factory());
 
   private final ConfigPaths paths;
 
