@@ -517,8 +517,16 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
         sessionStore.create(key, agentId, parentSessionKey, label, model);
 
     String message = optionalNonEmptyString(params, "message");
+    int messageSeq = 0;
+    int beforeCount = entry.messages.size();
     if (message != null) {
       sessionStore.addMessage(key, message);
+      int afterCount = entry.messages.size();
+      if (afterCount > beforeCount) {
+        messageSeq = beforeCount + 1;
+      } else {
+        messageSeq = afterCount;
+      }
     }
 
     Map<String, Object> entryPayload = new LinkedHashMap<>();
@@ -542,6 +550,11 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
 
     // Broadcast session change to all sessions subscribed via sessions.subscribe.
     emitSessionsChanged(key, "create");
+
+    // If the create request also provided an initial message, push it as well.
+    if (message != null && messageSeq > 0) {
+      emitSessionsMessage(key, messageSeq, message);
+    }
   }
 
   private void handleSessionsList(
