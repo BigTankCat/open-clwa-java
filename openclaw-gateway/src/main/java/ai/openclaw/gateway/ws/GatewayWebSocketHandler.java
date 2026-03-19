@@ -75,6 +75,8 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
   // Minimal in-memory node action queue + invoke-result waiting.
   private static final ConcurrentHashMap<String, ConcurrentLinkedQueue<PendingNodeAction>>
       NODE_PENDING_ACTIONS_BY_NODE_ID = new ConcurrentHashMap<>();
+  private static final long NODE_PENDING_ACTION_TTL_MS = 10 * 60_000;
+  private static final int NODE_PENDING_ACTION_MAX_PER_NODE = 64;
   private static final ConcurrentHashMap<String, CompletableFuture<NodeInvokeResolution>>
       NODE_INVOKE_WAITERS_BY_ID = new ConcurrentHashMap<>();
   private static final ConcurrentHashMap<String, PendingNodeInvokeMeta>
@@ -1176,6 +1178,7 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
           ErrorShape.of(ErrorCodes.INVALID_REQUEST, "node.pending.pull: nodeId required in connect"));
       return;
     }
+    prunePendingNodeActions(nodeId, System.currentTimeMillis());
     ConcurrentLinkedQueue<PendingNodeAction> q = NODE_PENDING_ACTIONS_BY_NODE_ID.get(nodeId);
     List<Map<String, Object>> actions = new ArrayList<>();
     if (q != null) {
@@ -1207,6 +1210,7 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       return;
     }
 
+    prunePendingNodeActions(nodeId, System.currentTimeMillis());
     Object idsObj = params != null ? params.get("ids") : null;
     List<String> ids = new ArrayList<>();
     if (idsObj instanceof List) {
@@ -1232,12 +1236,36 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       HashSet<String> toAck = new HashSet<>(ids);
       q.removeIf((a) -> toAck.contains(a.id));
     }
+    if (q != null && q.isEmpty()) {
+      NODE_PENDING_ACTIONS_BY_NODE_ID.remove(nodeId);
+    }
     int remaining = q != null ? q.size() : 0;
     Map<String, Object> payload = new LinkedHashMap<>();
     payload.put("nodeId", nodeId);
     payload.put("ackedIds", ids);
     payload.put("remainingCount", remaining);
     sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  private void prunePendingNodeActions(String nodeId, long nowMs) {
+    if (nodeId == null || nodeId.isBlank()) return;
+    ConcurrentLinkedQueue<PendingNodeAction> q = NODE_PENDING_ACTIONS_BY_NODE_ID.get(nodeId);
+    if (q == null || q.isEmpty()) return;
+
+    long minTimestampMs = nowMs - NODE_PENDING_ACTION_TTL_MS;
+    q.removeIf((a) -> a != null && a.enqueuedAtMs < minTimestampMs);
+
+    while (q.size() > NODE_PENDING_ACTION_MAX_PER_NODE) {
+      // ConcurrentLinkedQueue iterator preserves insertion order, so removing from the front
+      // approximates Node's splice(0, ... ) behavior.
+      PendingNodeAction toRemove = q.peek();
+      if (toRemove == null) break;
+      q.remove(toRemove);
+    }
+
+    if (q.isEmpty()) {
+      NODE_PENDING_ACTIONS_BY_NODE_ID.remove(nodeId);
+    }
   }
 
   private void enqueueNodeAction(String nodeId, String id, String command, String paramsJSON) {
@@ -1248,6 +1276,8 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     // Ensure idempotency in first slice: remove any existing action with same id.
     q.removeIf((a) -> id.equals(a.id));
     q.add(action);
+
+    prunePendingNodeActions(nodeId, System.currentTimeMillis());
   }
 
   private ErrorShape buildErrorShapeFromNodeError(Object errorObj) {
