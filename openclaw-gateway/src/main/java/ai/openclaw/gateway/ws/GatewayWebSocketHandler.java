@@ -91,6 +91,9 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
             }
           });
 
+  private static final ConcurrentHashMap<String, Map<String, Object>> POLL_DEDUPE_BY_ID =
+      new ConcurrentHashMap<>();
+
   private static final class PendingNodeAction {
     final String id;
     final String command;
@@ -691,24 +694,83 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
   }
 
   private void handlePoll(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
-    // Minimal poll implementation for request/response compatibility.
+    // poll: minimal compatibility with Node `gateway/server-methods/send.ts` shape.
     String to = optionalNonEmptyString(params, "to");
     String question = optionalNonEmptyString(params, "question");
     String idempotencyKey = optionalNonEmptyString(params, "idempotencyKey");
-    if (to == null || question == null || idempotencyKey == null) {
+    String channel = optionalNonEmptyString(params, "channel");
+
+    List<String> options = new ArrayList<>();
+    Object optionsObj = params != null ? params.get("options") : null;
+    if (optionsObj instanceof List) {
+      for (Object v : (List<?>) optionsObj) {
+        if (v instanceof String s) {
+          String t = s.trim();
+          if (!t.isEmpty()) options.add(t);
+        }
+      }
+    }
+
+    if (to == null || question == null || idempotencyKey == null || options.isEmpty()) {
       sendResponse(
           session,
           req.getId(),
           false,
           null,
-          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "poll: to/question/idempotencyKey required"));
+          ErrorShape.of(
+              ErrorCodes.INVALID_REQUEST,
+              "poll: to/question/options/idempotencyKey required"));
+      return;
+    }
+
+    // Node restrictions: durationSeconds and isAnonymous are only supported for Telegram polls.
+    Long durationSeconds = optionalNonNegativeLong(params, "durationSeconds");
+    Long durationHours = optionalNonNegativeLong(params, "durationHours");
+    Object silentObj = params != null ? params.get("silent") : null;
+    Object isAnonymousObj = params != null ? params.get("isAnonymous") : null;
+    Boolean silent = silentObj instanceof Boolean b ? b : null;
+    Boolean isAnonymous = isAnonymousObj instanceof Boolean b ? b : null;
+
+    String resolvedChannel = channel != null ? channel : "unknown";
+    boolean telegram = "telegram".equalsIgnoreCase(resolvedChannel);
+    if (durationSeconds != null && !telegram) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "durationSeconds is only supported for Telegram polls"));
+      return;
+    }
+    if (isAnonymous != null && !telegram) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "isAnonymous is only supported for Telegram polls"));
+      return;
+    }
+
+    // Lightweight idempotency: repeat requests get the same messageId.
+    Map<String, Object> cached = POLL_DEDUPE_BY_ID.get(idempotencyKey);
+    if (cached != null) {
+      sendResponse(session, req.getId(), true, cached, null);
       return;
     }
 
     Map<String, Object> payload = new LinkedHashMap<>();
     payload.put("runId", idempotencyKey);
     payload.put("messageId", UUID.randomUUID().toString());
-    payload.put("channel", "unknown");
+    payload.put("channel", resolvedChannel);
+    if (durationSeconds != null) payload.put("durationSeconds", durationSeconds);
+    if (durationHours != null) payload.put("durationHours", durationHours);
+    if (silent != null) payload.put("silent", silent);
+    if (isAnonymous != null) payload.put("isAnonymous", isAnonymous);
+    payload.put("question", question);
+    payload.put("options", options);
+
+    POLL_DEDUPE_BY_ID.put(idempotencyKey, payload);
     sendResponse(session, req.getId(), true, payload, null);
   }
 
