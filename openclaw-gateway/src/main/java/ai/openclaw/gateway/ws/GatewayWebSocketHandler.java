@@ -1,0 +1,1101 @@
+package ai.openclaw.gateway.ws;
+
+import ai.openclaw.config.ConfigLoader;
+import ai.openclaw.config.ConfigSnapshot;
+import ai.openclaw.config.ConfigWriter;
+import ai.openclaw.gateway.auth.MethodScopes;
+import ai.openclaw.config.ConfigMergePatch;
+import ai.openclaw.protocol.EventFrame;
+import ai.openclaw.gateway.sessions.InMemorySessionStore;
+import ai.openclaw.protocol.ErrorCodes;
+import ai.openclaw.protocol.ErrorShape;
+import ai.openclaw.protocol.RequestFrame;
+import ai.openclaw.protocol.ResponseFrame;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
+import java.util.Set;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.env.Environment;
+import org.springframework.stereotype.Component;
+import org.springframework.web.socket.CloseStatus;
+import org.springframework.web.socket.TextMessage;
+import org.springframework.web.socket.WebSocketSession;
+import org.springframework.web.socket.handler.TextWebSocketHandler;
+
+/**
+ * WebSocket JSON-RPC handler: connect, health, config.get.
+ * Auth: Bearer token from query or first message (connect params); aligns with Node gateway auth.
+ */
+@Component
+public class GatewayWebSocketHandler extends TextWebSocketHandler {
+
+  private static final ObjectMapper MAPPER = new ObjectMapper();
+  private static final long HEALTH_REFRESH_INTERVAL_MS = 60_000;
+  private static final Set<String> EVENT_SLOTS =
+      Set.of("sessions.changed", "sessions.messages");
+
+  private static final ConcurrentHashMap<String, WebSocketSession> ACTIVE_SESSIONS =
+      new ConcurrentHashMap<>();
+
+  private static final ConcurrentHashMap<String, WsContext> CONTEXTS_BY_CONN_ID =
+      new ConcurrentHashMap<>();
+
+  @Value("${openclaw.version:2026.3.14}")
+  private String version;
+
+  private final ConfigLoader configLoader;
+  private final String gatewayToken;
+
+  private interface WsMethodHandler {
+    void handle(WebSocketSession session, RequestFrame req, Map<String, Object> params);
+  }
+
+  // Very small in-memory cache for health responses (first slice).
+  // In Node this is in server-maintenance.ts; we mirror behavior for now.
+  private volatile Map<String, Object> cachedHealthPayload;
+  private volatile long cachedHealthTs;
+
+  // Minimal in-memory node action queue + invoke-result waiting.
+  private static final ConcurrentHashMap<String, ConcurrentLinkedQueue<PendingNodeAction>>
+      NODE_PENDING_ACTIONS_BY_NODE_ID = new ConcurrentHashMap<>();
+  private static final ConcurrentHashMap<String, CompletableFuture<NodeInvokeResolution>>
+      NODE_INVOKE_WAITERS_BY_ID = new ConcurrentHashMap<>();
+  private static final ConcurrentHashMap<String, PendingNodeInvokeMeta>
+      NODE_INVOKE_META_BY_ID = new ConcurrentHashMap<>();
+
+  private static final class PendingNodeAction {
+    final String id;
+    final String command;
+    final String paramsJSON;
+    final long enqueuedAtMs;
+
+    PendingNodeAction(String id, String command, String paramsJSON, long enqueuedAtMs) {
+      this.id = id;
+      this.command = command;
+      this.paramsJSON = paramsJSON;
+      this.enqueuedAtMs = enqueuedAtMs;
+    }
+  }
+
+  private static final class PendingNodeInvokeMeta {
+    final String nodeId;
+    final String command;
+
+    PendingNodeInvokeMeta(String nodeId, String command) {
+      this.nodeId = nodeId;
+      this.command = command;
+    }
+  }
+
+  private static final class NodeInvokeResolution {
+    final boolean ok;
+    final Object payload;
+    final String payloadJSON;
+    final ErrorShape error;
+
+    NodeInvokeResolution(boolean ok, Object payload, String payloadJSON, ErrorShape error) {
+      this.ok = ok;
+      this.payload = payload;
+      this.payloadJSON = payloadJSON;
+      this.error = error;
+    }
+  }
+
+  private final Map<String, WsMethodHandler> methodHandlers;
+  private final ConfigWriter configWriter;
+  private final InMemorySessionStore sessionStore;
+
+  public GatewayWebSocketHandler(
+      ConfigLoader configLoader,
+      ConfigWriter configWriter,
+      InMemorySessionStore sessionStore,
+      Environment env) {
+    this.configLoader = configLoader;
+    this.configWriter = configWriter;
+    this.sessionStore = sessionStore;
+    this.gatewayToken = env.getProperty("OPENCLAW_GATEWAY_TOKEN", "");
+    this.methodHandlers =
+        Map.of(
+            "health",
+            (session, req, params) -> handleHealth(session, req, params),
+            "poll",
+            (session, req, params) -> handlePoll(session, req, params),
+            "config.get",
+            (session, req, params) -> handleConfigGet(session, req, params),
+            "config.apply",
+            (session, req, params) -> handleConfigApply(session, req, params),
+            "config.patch",
+            (session, req, params) -> handleConfigPatch(session, req, params),
+            "node.invoke",
+            (session, req, params) -> handleNodeInvoke(session, req, params),
+            "node.invoke.result",
+            (session, req, params) -> handleNodeInvokeResult(session, req, params),
+            "node.event",
+            (session, req, params) -> handleNodeEvent(session, req, params),
+            "node.pending.pull",
+            (session, req, params) -> handleNodePendingPull(session, req, params),
+            "node.pending.ack",
+            (session, req, params) -> handleNodePendingAck(session, req, params),
+            "sessions.create",
+            (session, req, params) -> handleSessionsCreate(session, req, params),
+            "sessions.list",
+            (session, req, params) -> handleSessionsList(session, req, params),
+            "sessions.get",
+            (session, req, params) -> handleSessionsGet(session, req, params),
+            "sessions.delete",
+            (session, req, params) -> handleSessionsDelete(session, req, params),
+            "sessions.subscribe",
+            (session, req, params) -> handleSessionsSubscribe(session, req, params),
+            "sessions.unsubscribe",
+            (session, req, params) -> handleSessionsUnsubscribe(session, req, params),
+            "sessions.messages.subscribe",
+            (session, req, params) -> handleSessionsMessagesSubscribe(session, req, params),
+            "sessions.messages.unsubscribe",
+            (session, req, params) -> handleSessionsMessagesUnsubscribe(session, req, params),
+            "chat.send",
+            (session, req, params) -> handleChatSend(session, req, params),
+            "status",
+            (session, req, params) -> handleStatus(session, req));
+  }
+
+  @Override
+  public void afterConnectionEstablished(WebSocketSession session) throws Exception {
+    WsContext ctx = new WsContext();
+    ctx.connId = session.getId();
+    session.getAttributes().put(WsContext.KEY, ctx);
+    ACTIVE_SESSIONS.put(ctx.connId, session);
+    CONTEXTS_BY_CONN_ID.put(ctx.connId, ctx);
+  }
+
+  @Override
+  protected void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
+    String payload = message.getPayload();
+    WsContext ctx = (WsContext) session.getAttributes().get(WsContext.KEY);
+    if (ctx == null) {
+      ctx = new WsContext();
+      session.getAttributes().put(WsContext.KEY, ctx);
+    }
+
+    try {
+      RequestFrame req = MAPPER.readValue(payload, RequestFrame.class);
+      if (req == null || req.getId() == null || req.getMethod() == null) {
+        sendResponse(session, req != null ? req.getId() : null, false, null, ErrorShape.of(ErrorCodes.INVALID_REQUEST, "missing id or method"));
+        return;
+      }
+
+      String method = req.getMethod();
+      Map<String, Object> params = req.getParams();
+
+      if ("connect".equals(method)) {
+        handleConnect(session, ctx, req, params);
+        return;
+      }
+
+      // Node behavior: "health" is allowed without connect.
+      boolean isHealth = "health".equals(method);
+      if (!ctx.connected && !isHealth) {
+        sendResponse(
+            session,
+            req.getId(),
+            false,
+            null,
+            ErrorShape.of(ErrorCodes.INVALID_REQUEST, "send connect first"));
+        return;
+      }
+
+      // Only enforce operator scope for methods other than health.
+      if (!isHealth) {
+        if (ctx.role != null && "node".equalsIgnoreCase(ctx.role)) {
+          // When gateway connection role is `node`, operator scopes are not required,
+          // but only node-role methods are allowed.
+          if (!MethodScopes.isNodeRoleMethod(method)) {
+            sendResponse(
+                session,
+                req.getId(),
+                false,
+                null,
+                ErrorShape.of(ErrorCodes.INVALID_REQUEST, "unauthorized role: node"));
+            return;
+          }
+        } else {
+          List<String> scopes = ctx.scopes;
+          String missingScope = MethodScopes.authorize(method, scopes);
+          if (missingScope != null) {
+            sendResponse(
+                session,
+                req.getId(),
+                false,
+                null,
+                ErrorShape.of(ErrorCodes.INVALID_REQUEST, "missing scope: " + missingScope));
+            return;
+          }
+        }
+      }
+
+      WsMethodHandler handler = methodHandlers.get(method);
+      if (handler == null) {
+        sendResponse(
+            session,
+            req.getId(),
+            false,
+            null,
+            ErrorShape.of(ErrorCodes.INVALID_REQUEST, "unknown method: " + method));
+        return;
+      }
+      handler.handle(session, req, params);
+    } catch (Exception e) {
+      sendResponse(session, null, false, null, ErrorShape.of(ErrorCodes.UNAVAILABLE, e.getMessage()));
+    }
+  }
+
+  private void handleConnect(WebSocketSession session, WsContext ctx, RequestFrame req, Map<String, Object> params) {
+    String token = tokenFromParams(params);
+    if (gatewayToken != null && !gatewayToken.isBlank()) {
+          if (token == null || !java.util.Objects.equals(token, gatewayToken)) {
+            sendResponse(session, req.getId(), false, null, ErrorShape.of(ErrorCodes.INVALID_REQUEST, "unauthorized"));
+            return;
+          }
+        }
+    ctx.connected = true;
+    ctx.role = optionalNonEmptyString(params, "role");
+    if (ctx.role == null) ctx.role = "operator";
+    ctx.nodeId = resolveNodeIdFromConnectParams(params);
+    ctx.scopes = scopesFromParams(params);
+    if (ctx.scopes == null) {
+      ctx.scopes = List.of(MethodScopes.READ_SCOPE, MethodScopes.WRITE_SCOPE, MethodScopes.ADMIN_SCOPE);
+    }
+    Map<String, Object> hello = Map.of(
+        "type", "hello-ok",
+        "protocol", 1,
+        "server", Map.of("version", version, "connId", ctx.connId),
+        "features",
+            Map.of(
+                "methods",
+                List.of(
+                    "health",
+                    "poll",
+                    "config.get",
+                    "config.apply",
+                    "config.patch",
+                    "sessions.create",
+                    "sessions.list",
+                    "sessions.get",
+                    "sessions.delete",
+                    "sessions.subscribe",
+                    "sessions.unsubscribe",
+                    "sessions.messages.subscribe",
+                    "sessions.messages.unsubscribe",
+                    "chat.send",
+                    "node.invoke",
+                    "node.invoke.result",
+                    "node.event",
+                    "node.pending.pull",
+                    "node.pending.ack",
+                    "status",
+                    "connect"),
+                "events",
+                EVENT_SLOTS.stream().toList()),
+        "snapshot", Map.of("health", healthPayload()),
+        "policy", Map.of("maxPayload", 25 * 1024 * 1024, "maxBufferedBytes", 50 * 1024 * 1024, "tickIntervalMs", 30_000),
+        "auth", Map.of("role", ctx.role, "scopes", ctx.scopes));
+    send(session, hello);
+    sendResponse(session, req.getId(), true, Map.of("ok", true), null);
+  }
+
+  @SuppressWarnings("unchecked")
+  private String tokenFromParams(Map<String, Object> params) {
+    if (params == null) return null;
+    Object auth = params.get("auth");
+    if (auth instanceof Map) {
+      Object t = ((Map<String, Object>) auth).get("token");
+      if (t instanceof String) return (String) t;
+      Object p = ((Map<String, Object>) auth).get("password");
+      if (p instanceof String) return (String) p;
+    }
+    return null;
+  }
+
+  @SuppressWarnings("unchecked")
+  private List<String> scopesFromParams(Map<String, Object> params) {
+    if (params == null) return null;
+    Object s = params.get("scopes");
+    if (s instanceof List) {
+      return (List<String>) s;
+    }
+    return null;
+  }
+
+  @SuppressWarnings("unchecked")
+  private String resolveNodeIdFromConnectParams(Map<String, Object> params) {
+    if (params == null) return null;
+    Object device = params.get("device");
+    if (device instanceof Map) {
+      Map<String, Object> dev = (Map<String, Object>) device;
+      String id = optionalNonEmptyString(dev, "id");
+      if (id != null) return id;
+    }
+    Object client = params.get("client");
+    if (client instanceof Map) {
+      Map<String, Object> c = (Map<String, Object>) client;
+      String id = optionalNonEmptyString(c, "id");
+      if (id != null) return id;
+    }
+    return null;
+  }
+
+  private void handleHealth(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    boolean wantsProbe = params != null && Boolean.TRUE.equals(params.get("probe"));
+    long now = System.currentTimeMillis();
+    Map<String, Object> cached = cachedHealthPayload;
+    if (!wantsProbe && cached != null && now - cachedHealthTs < HEALTH_REFRESH_INTERVAL_MS) {
+      // Return cached snapshot; include a small indicator similar to Node.
+      Map<String, Object> withHint = Map.of(
+          "ok", cached.get("ok"),
+          "version", cached.get("version"),
+          "ts", cached.get("ts"),
+          "cached", true);
+      sendResponse(session, req.getId(), true, withHint, null);
+      return;
+    }
+
+    Map<String, Object> payload = healthPayload();
+    cachedHealthPayload = payload;
+    cachedHealthTs = now;
+    sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  private Map<String, Object> healthPayload() {
+    return Map.of(
+        "ok", true,
+        "version", version,
+        "ts", System.currentTimeMillis());
+  }
+
+  private void handleConfigGet(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    ConfigSnapshot snapshot = configLoader.load();
+    Map<String, Object> payload = Map.of(
+        "config", snapshot.getConfig(),
+        "path", snapshot.getConfigPath() != null ? snapshot.getConfigPath() : "",
+        "exists", snapshot.isExists());
+    sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  @SuppressWarnings("unchecked")
+  private void handleConfigApply(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String raw = requireNonEmptyString(params, "raw");
+    if (raw == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "config.apply: raw (string) required"));
+      return;
+    }
+
+    Map<String, Object> parsed;
+    try {
+      parsed = parseJsonObject(raw);
+    } catch (Exception e) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "config.apply: invalid raw json: " + e.getMessage()));
+      return;
+    }
+
+    configWriter.write(parsed);
+    Long delayMs = optionalNonNegativeLong(params, "restartDelayMs");
+    Map<String, Object> restart = new LinkedHashMap<>();
+    restart.put("reason", "config.apply");
+    restart.put("delayMs", delayMs);
+    Map<String, Object> sentinel = new LinkedHashMap<>();
+    sentinel.put("path", null);
+    sentinel.put("payload", null);
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("ok", true);
+    payload.put("path", configWriter.getConfigPath());
+    payload.put("config", parsed);
+    payload.put("restart", restart);
+    payload.put("sentinel", sentinel);
+    sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  private void handleConfigPatch(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String raw = requireNonEmptyString(params, "raw");
+    if (raw == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "config.patch: raw (string) required"));
+      return;
+    }
+
+    ConfigSnapshot snapshot = configLoader.load();
+    if (!snapshot.isExists()) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "invalid config; fix before patching"));
+      return;
+    }
+
+    Map<String, Object> patch;
+    try {
+      patch = parseJsonObject(raw);
+    } catch (Exception e) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "config.patch: invalid raw json: " + e.getMessage()));
+      return;
+    }
+
+    Map<String, Object> merged = ConfigMergePatch.merge(snapshot.getConfig(), patch);
+    configWriter.write(merged);
+    Long delayMs = optionalNonNegativeLong(params, "restartDelayMs");
+    Map<String, Object> restart = new LinkedHashMap<>();
+    restart.put("reason", "config.patch");
+    restart.put("delayMs", delayMs);
+    Map<String, Object> sentinel = new LinkedHashMap<>();
+    sentinel.put("path", null);
+    sentinel.put("payload", null);
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("ok", true);
+    payload.put("path", configWriter.getConfigPath());
+    payload.put("config", merged);
+    payload.put("restart", restart);
+    payload.put("sentinel", sentinel);
+    sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  private void handleSessionsCreate(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String agentId = optionalNonEmptyString(params, "agentId");
+    if (agentId == null) agentId = "default";
+    String parentSessionKey = optionalNonEmptyString(params, "parentSessionKey");
+    String label = optionalNonEmptyString(params, "label");
+    String model = optionalNonEmptyString(params, "model");
+
+    String key = optionalNonEmptyString(params, "key");
+    if (key == null) {
+      key = "agent:" + agentId + ":dashboard:" + UUID.randomUUID().toString();
+    }
+
+    InMemorySessionStore.SessionEntry entry =
+        sessionStore.create(key, agentId, parentSessionKey, label, model);
+
+    String message = optionalNonEmptyString(params, "message");
+    if (message != null) {
+      sessionStore.addMessage(key, message);
+    }
+
+    Map<String, Object> entryPayload = new LinkedHashMap<>();
+    entryPayload.put("key", entry.key);
+    entryPayload.put("sessionId", entry.sessionId);
+    entryPayload.put("agentId", entry.agentId);
+    entryPayload.put("parentSessionKey", entry.parentSessionKey);
+    entryPayload.put("label", entry.label);
+    entryPayload.put("model", entry.model);
+    entryPayload.put("createdAt", entry.createdAt);
+    entryPayload.put("updatedAt", entry.updatedAt);
+    entryPayload.put("messagesCount", entry.messages.size());
+
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("ok", true);
+    payload.put("key", key);
+    payload.put("sessionId", entry.sessionId);
+    payload.put("entry", entryPayload);
+    payload.put("runStarted", false);
+    sendResponse(session, req.getId(), true, payload, null);
+
+    // Broadcast session change to all sessions subscribed via sessions.subscribe.
+    emitSessionsChanged(key, "create");
+  }
+
+  private void handleSessionsList(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    int limit = optionalPositiveInt(params, "limit", 50);
+    String label = optionalNonEmptyString(params, "label");
+    String search = optionalNonEmptyString(params, "search");
+
+    List<Map<String, Object>> rows = sessionStore.listSessions(limit, label, search);
+    long now = System.currentTimeMillis();
+    Map<String, Object> payload =
+        Map.of(
+            "ts", now,
+            "path", "in-memory",
+            "count", rows.size(),
+            "defaults", Map.of(),
+            "sessions", rows);
+    sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  private void handleSessionsGet(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String key = optionalNonEmptyString(params, "key");
+    if (key == null) {
+      key = optionalNonEmptyString(params, "sessionKey");
+    }
+    if (key == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "sessions.get: key required"));
+      return;
+    }
+    int limit = optionalPositiveInt(params, "limit", 200);
+    List<String> messages = sessionStore.listMessages(key, limit);
+    Map<String, Object> payload = Map.of("messages", messages);
+    sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  private void handleSessionsDelete(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String key = optionalNonEmptyString(params, "key");
+    if (key == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "sessions.delete: key required"));
+      return;
+    }
+    boolean deleted = sessionStore.delete(key);
+    Map<String, Object> payload =
+        Map.of(
+            "ok", true,
+            "key", key,
+            "deleted", deleted,
+            "archived", List.of());
+    sendResponse(session, req.getId(), true, payload, null);
+
+    // Broadcast session change.
+    if (deleted) {
+      emitSessionsChanged(key, "delete");
+    }
+  }
+
+  private void handleChatSend(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String sessionKey = optionalNonEmptyString(params, "sessionKey");
+    String message = optionalNonEmptyString(params, "message");
+    if (sessionKey == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "chat.send: sessionKey required"));
+      return;
+    }
+    if (message == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "chat.send: message required"));
+      return;
+    }
+
+    InMemorySessionStore.SessionEntry entry = sessionStore.get(sessionKey);
+    if (entry == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "chat.send: session not found"));
+      return;
+    }
+
+    int before = entry.messages.size();
+    sessionStore.addMessage(sessionKey, message);
+    int after = entry.messages.size();
+    int messageSeq = after > before ? before + 1 : after;
+
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("ok", true);
+    payload.put("aborted", false);
+    payload.put("runIds", List.of());
+    payload.put("sessionKey", sessionKey);
+    payload.put("messageSeq", messageSeq);
+    sendResponse(session, req.getId(), true, payload, null);
+
+    // Push events to subscribers.
+    emitSessionsChanged(sessionKey, "send");
+    emitSessionsMessage(sessionKey, messageSeq, message);
+  }
+
+  private void handlePoll(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    // Minimal poll implementation for request/response compatibility.
+    String to = optionalNonEmptyString(params, "to");
+    String question = optionalNonEmptyString(params, "question");
+    String idempotencyKey = optionalNonEmptyString(params, "idempotencyKey");
+    if (to == null || question == null || idempotencyKey == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "poll: to/question/idempotencyKey required"));
+      return;
+    }
+
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("runId", idempotencyKey);
+    payload.put("messageId", UUID.randomUUID().toString());
+    payload.put("channel", "unknown");
+    sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  private void handleNodeInvoke(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String nodeId = optionalNonEmptyString(params, "nodeId");
+    String command = optionalNonEmptyString(params, "command");
+    String id = optionalNonEmptyString(params, "idempotencyKey");
+    Long timeoutMs = optionalNonNegativeLong(params, "timeoutMs");
+
+    if (nodeId == null || command == null || id == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "node.invoke: nodeId/command/idempotencyKey required"));
+      return;
+    }
+
+    long waitTimeoutMs = timeoutMs != null && timeoutMs > 0 ? timeoutMs : 10_000;
+
+    CompletableFuture<NodeInvokeResolution> waiter = new CompletableFuture<>();
+    NODE_INVOKE_WAITERS_BY_ID.put(id, waiter);
+    NODE_INVOKE_META_BY_ID.put(id, new PendingNodeInvokeMeta(nodeId, command));
+
+    Object rawParams = params.get("params");
+    String paramsJSON = null;
+    if (rawParams != null) {
+      try {
+        paramsJSON = MAPPER.writeValueAsString(rawParams);
+      } catch (Exception ignored) {
+        paramsJSON = null;
+      }
+    }
+    enqueueNodeAction(nodeId, id, command, paramsJSON);
+
+    try {
+      NodeInvokeResolution resolution = waiter.get(waitTimeoutMs, TimeUnit.MILLISECONDS);
+      if (resolution.ok) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("ok", true);
+        payload.put("nodeId", nodeId);
+        payload.put("command", command);
+        payload.put("payload", resolution.payload);
+        payload.put("payloadJSON", resolution.payloadJSON);
+        sendResponse(session, req.getId(), true, payload, null);
+      } else {
+        sendResponse(session, req.getId(), false, null, resolution.error);
+      }
+      return;
+    } catch (TimeoutException e) {
+      NODE_INVOKE_WAITERS_BY_ID.remove(id);
+      NODE_INVOKE_META_BY_ID.remove(id);
+      ErrorShape err = ErrorShape.of(ErrorCodes.AGENT_TIMEOUT, "node.invoke timeout waiting for node.invoke.result");
+      sendResponse(session, req.getId(), false, null, err);
+      return;
+    } catch (Exception e) {
+      NODE_INVOKE_WAITERS_BY_ID.remove(id);
+      NODE_INVOKE_META_BY_ID.remove(id);
+      ErrorShape err = ErrorShape.of(ErrorCodes.UNAVAILABLE, "node.invoke failed: " + e.getMessage());
+      sendResponse(session, req.getId(), false, null, err);
+      return;
+    }
+  }
+
+  private void handleNodeInvokeResult(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String id = optionalNonEmptyString(params, "id");
+    String nodeId = optionalNonEmptyString(params, "nodeId");
+    Object okObj = params.get("ok");
+    Boolean ok = okObj instanceof Boolean b ? b : null;
+
+    if (id == null || nodeId == null || ok == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "node.invoke.result: id/nodeId/ok required"));
+      return;
+    }
+
+    // Remove from pending list regardless of ok; ack will be later slice.
+    ConcurrentLinkedQueue<PendingNodeAction> q = NODE_PENDING_ACTIONS_BY_NODE_ID.get(nodeId);
+    if (q != null) {
+      q.removeIf((a) -> id.equals(a.id));
+    }
+
+    CompletableFuture<NodeInvokeResolution> waiter = NODE_INVOKE_WAITERS_BY_ID.remove(id);
+    NODE_INVOKE_META_BY_ID.remove(id);
+    if (waiter == null) {
+      // Late-arriving result expected: return success and mark ignored.
+      Map<String, Object> payload = new LinkedHashMap<>();
+      payload.put("ok", true);
+      payload.put("ignored", true);
+      sendResponse(session, req.getId(), true, payload, null);
+      return;
+    }
+
+    Object payloadObj = params.get("payload");
+    String payloadJSON = optionalNonEmptyString(params, "payloadJSON");
+    ErrorShape err = null;
+    if (!ok) {
+      err = buildErrorShapeFromNodeError(params.get("error"));
+    }
+    waiter.complete(new NodeInvokeResolution(ok, payloadObj, payloadJSON, err));
+
+    sendResponse(session, req.getId(), true, Map.of("ok", true), null);
+  }
+
+  private void handleNodeEvent(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    // Minimal no-op: just acknowledge.
+    sendResponse(session, req.getId(), true, Map.of("ok", true), null);
+  }
+
+  private void handleNodePendingPull(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    WsContext ctx = (WsContext) session.getAttributes().get(WsContext.KEY);
+    String nodeId = ctx != null ? ctx.nodeId : null;
+    if (nodeId == null || nodeId.isBlank()) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "node.pending.pull: nodeId required in connect"));
+      return;
+    }
+    ConcurrentLinkedQueue<PendingNodeAction> q = NODE_PENDING_ACTIONS_BY_NODE_ID.get(nodeId);
+    List<Map<String, Object>> actions = new ArrayList<>();
+    if (q != null) {
+      for (PendingNodeAction a : q) {
+        Map<String, Object> action = new LinkedHashMap<>();
+        action.put("id", a.id);
+        action.put("command", a.command);
+        action.put("paramsJSON", a.paramsJSON);
+        action.put("enqueuedAtMs", a.enqueuedAtMs);
+        actions.add(action);
+      }
+    }
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("nodeId", nodeId);
+    payload.put("actions", actions);
+    sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  private void handleNodePendingAck(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    WsContext ctx = (WsContext) session.getAttributes().get(WsContext.KEY);
+    String nodeId = ctx != null ? ctx.nodeId : null;
+    if (nodeId == null || nodeId.isBlank()) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "node.pending.ack: nodeId required in connect"));
+      return;
+    }
+
+    Object idsObj = params != null ? params.get("ids") : null;
+    List<String> ids = new ArrayList<>();
+    if (idsObj instanceof List) {
+      for (Object v : (List<?>) idsObj) {
+        if (v instanceof String s) {
+          String t = s.trim();
+          if (!t.isEmpty()) ids.add(t);
+        }
+      }
+    }
+    if (ids.isEmpty()) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "node.pending.ack: ids (non-empty) required"));
+      return;
+    }
+
+    ConcurrentLinkedQueue<PendingNodeAction> q = NODE_PENDING_ACTIONS_BY_NODE_ID.get(nodeId);
+    if (q != null) {
+      HashSet<String> toAck = new HashSet<>(ids);
+      q.removeIf((a) -> toAck.contains(a.id));
+    }
+    int remaining = q != null ? q.size() : 0;
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("nodeId", nodeId);
+    payload.put("ackedIds", ids);
+    payload.put("remainingCount", remaining);
+    sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  private void enqueueNodeAction(String nodeId, String id, String command, String paramsJSON) {
+    PendingNodeAction action =
+        new PendingNodeAction(id, command, paramsJSON, System.currentTimeMillis());
+    ConcurrentLinkedQueue<PendingNodeAction> q =
+        NODE_PENDING_ACTIONS_BY_NODE_ID.computeIfAbsent(nodeId, k -> new ConcurrentLinkedQueue<>());
+    // Ensure idempotency in first slice: remove any existing action with same id.
+    q.removeIf((a) -> id.equals(a.id));
+    q.add(action);
+  }
+
+  private ErrorShape buildErrorShapeFromNodeError(Object errorObj) {
+    if (errorObj instanceof Map) {
+      @SuppressWarnings("unchecked")
+      Map<String, Object> err = (Map<String, Object>) errorObj;
+      String code = err.get("code") instanceof String s ? s : null;
+      String message = err.get("message") instanceof String s ? s : null;
+      String normalizedCode =
+          code != null
+              ? switch (code) {
+                case ErrorCodes.NOT_LINKED,
+                    ErrorCodes.NOT_PAIRED,
+                    ErrorCodes.AGENT_TIMEOUT,
+                    ErrorCodes.INVALID_REQUEST,
+                    ErrorCodes.UNAVAILABLE -> code;
+                default -> ErrorCodes.UNAVAILABLE;
+              }
+              : ErrorCodes.UNAVAILABLE;
+      String normalizedMessage = message != null ? message : "node error";
+      return ErrorShape.of(normalizedCode, normalizedMessage);
+    }
+    return ErrorShape.of(ErrorCodes.UNAVAILABLE, "node error");
+  }
+
+  private void handleStatus(WebSocketSession session, RequestFrame req) {
+    // Minimal shape compatible with Node `StatusSummary` (src/commands/status.types.ts).
+    Map<String, Object> sessions = new LinkedHashMap<>();
+    sessions.put("paths", List.of());
+    sessions.put("count", 0);
+    Map<String, Object> defaults = new LinkedHashMap<>();
+    defaults.put("model", null);
+    defaults.put("contextTokens", null);
+    sessions.put("defaults", defaults);
+    sessions.put("recent", List.of());
+    sessions.put("byAgent", List.of());
+
+    Map<String, Object> heartbeat = new LinkedHashMap<>();
+    heartbeat.put("defaultAgentId", "default");
+    heartbeat.put("agents", List.of());
+
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("runtimeVersion", version);
+    payload.put("linkChannel", null);
+    payload.put("heartbeat", heartbeat);
+    payload.put("channelSummary", List.of());
+    payload.put("queuedSystemEvents", List.of());
+    payload.put("sessions", sessions);
+
+    sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  private void sendResponse(WebSocketSession session, String id, boolean ok, Object payload, ErrorShape error) {
+    if (id == null) return;
+    ResponseFrame res = new ResponseFrame(id, ok, payload, error);
+    send(session, res);
+  }
+
+  private void send(WebSocketSession session, Object obj) {
+    try {
+      if (session.isOpen()) {
+        session.sendMessage(new TextMessage(MAPPER.writeValueAsString(obj)));
+      }
+    } catch (Exception e) {
+      // log
+    }
+  }
+
+  @Override
+  public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
+    WsContext ctx = (WsContext) session.getAttributes().get(WsContext.KEY);
+    session.getAttributes().remove(WsContext.KEY);
+    if (ctx != null && ctx.connId != null) {
+      ACTIVE_SESSIONS.remove(ctx.connId);
+      CONTEXTS_BY_CONN_ID.remove(ctx.connId);
+    }
+  }
+
+  public static final class WsContext {
+    static final String KEY = "ws.ctx";
+    boolean connected;
+    String role;
+    List<String> scopes;
+    String connId;
+    String nodeId;
+
+    // subscriptions (first slice)
+    volatile boolean sessionsSubscribed;
+    Set<String> subscribedMessageKeys = ConcurrentHashMap.newKeySet();
+    AtomicLong nextEventSeq = new AtomicLong(1);
+  }
+
+  private String requireNonEmptyString(Map<String, Object> params, String key) {
+    if (params == null) return null;
+    Object v = params.get(key);
+    if (!(v instanceof String s)) return null;
+    String trimmed = s.trim();
+    return trimmed.isEmpty() ? null : trimmed;
+  }
+
+  private Long optionalNonNegativeLong(Map<String, Object> params, String key) {
+    if (params == null) return null;
+    Object v = params.get(key);
+    if (v instanceof Integer i) {
+      return i >= 0 ? (long) i : null;
+    }
+    if (v instanceof Long l) {
+      return l >= 0 ? l : null;
+    }
+    return null;
+  }
+
+  @SuppressWarnings("unchecked")
+  private Map<String, Object> parseJsonObject(String raw) throws Exception {
+    JsonNode node = MAPPER.readTree(raw);
+    if (node == null || !node.isObject()) {
+      throw new IllegalArgumentException("raw must be a JSON object");
+    }
+    return (Map<String, Object>) MAPPER.convertValue(node, Map.class);
+  }
+
+  private String optionalNonEmptyString(Map<String, Object> params, String key) {
+    if (params == null) return null;
+    Object v = params.get(key);
+    if (!(v instanceof String s)) return null;
+    String trimmed = s.trim();
+    return trimmed.isEmpty() ? null : trimmed;
+  }
+
+  private int optionalPositiveInt(Map<String, Object> params, String key, int defaultValue) {
+    if (params == null) return defaultValue;
+    Object v = params.get(key);
+    if (v instanceof Integer i) {
+      return i > 0 ? i : defaultValue;
+    }
+    if (v instanceof Long l) {
+      return l > 0 && l <= Integer.MAX_VALUE ? (int) l : defaultValue;
+    }
+    return defaultValue;
+  }
+
+  private void handleSessionsSubscribe(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    WsContext ctx = (WsContext) session.getAttributes().get(WsContext.KEY);
+    if (ctx != null) {
+      ctx.sessionsSubscribed = true;
+    }
+    sendResponse(session, req.getId(), true, Map.of("subscribed", true), null);
+  }
+
+  private void handleSessionsUnsubscribe(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    WsContext ctx = (WsContext) session.getAttributes().get(WsContext.KEY);
+    if (ctx != null) {
+      ctx.sessionsSubscribed = false;
+    }
+    sendResponse(session, req.getId(), true, Map.of("subscribed", false), null);
+  }
+
+  private void handleSessionsMessagesSubscribe(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String key = optionalNonEmptyString(params, "key");
+    WsContext ctx = (WsContext) session.getAttributes().get(WsContext.KEY);
+    if (key == null) {
+      sendResponse(session, req.getId(), false, null, ErrorShape.of(ErrorCodes.INVALID_REQUEST, "sessions.messages.subscribe: key required"));
+      return;
+    }
+    if (ctx != null) {
+      ctx.subscribedMessageKeys.add(key);
+    }
+    sendResponse(session, req.getId(), true, Map.of("subscribed", true, "key", key), null);
+  }
+
+  private void handleSessionsMessagesUnsubscribe(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String key = optionalNonEmptyString(params, "key");
+    WsContext ctx = (WsContext) session.getAttributes().get(WsContext.KEY);
+    if (key == null) {
+      sendResponse(session, req.getId(), false, null, ErrorShape.of(ErrorCodes.INVALID_REQUEST, "sessions.messages.unsubscribe: key required"));
+      return;
+    }
+    if (ctx != null) {
+      ctx.subscribedMessageKeys.remove(key);
+    }
+    sendResponse(session, req.getId(), true, Map.of("subscribed", false, "key", key), null);
+  }
+
+  private void emitSessionsChanged(String sessionKey, String reason) {
+    for (Map.Entry<String, WsContext> e : CONTEXTS_BY_CONN_ID.entrySet()) {
+      WsContext ctx = e.getValue();
+      if (ctx == null || !ctx.sessionsSubscribed) continue;
+      WebSocketSession ws = ACTIVE_SESSIONS.get(e.getKey());
+      if (ws == null || !ws.isOpen()) continue;
+      Map<String, Object> payload = new LinkedHashMap<>();
+      payload.put("sessionKey", sessionKey);
+      payload.put("reason", reason);
+      payload.put("ts", System.currentTimeMillis());
+      emitEvent(ws, ctx, "sessions.changed", payload);
+    }
+  }
+
+  private void emitSessionsMessage(String sessionKey, int seq, String message) {
+    for (Map.Entry<String, WsContext> e : CONTEXTS_BY_CONN_ID.entrySet()) {
+      WsContext ctx = e.getValue();
+      if (ctx == null || ctx.subscribedMessageKeys == null || !ctx.subscribedMessageKeys.contains(sessionKey)) continue;
+      WebSocketSession ws = ACTIVE_SESSIONS.get(e.getKey());
+      if (ws == null || !ws.isOpen()) continue;
+
+      Map<String, Object> messagePayload = new LinkedHashMap<>();
+      messagePayload.put("text", message);
+      messagePayload.put("seq", seq);
+
+      Map<String, Object> payload = new LinkedHashMap<>();
+      payload.put("key", sessionKey);
+      payload.put("message", messagePayload);
+      payload.put("messageSeq", seq);
+      payload.put("ts", System.currentTimeMillis());
+      emitEvent(ws, ctx, "sessions.messages", payload);
+    }
+  }
+
+  private void emitEvent(WebSocketSession session, WsContext ctx, String eventName, Map<String, Object> payload) {
+    if (ctx == null) return;
+    if (!EVENT_SLOTS.contains(eventName)) return;
+    EventFrame frame = new EventFrame();
+    frame.setEvent(eventName);
+    frame.setPayload(payload);
+    frame.setSeq(ctx.nextEventSeq.getAndIncrement());
+    send(session, frame);
+  }
+}

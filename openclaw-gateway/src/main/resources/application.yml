@@ -1,0 +1,16 @@
+server:
+  port: ${OPENCLAW_GATEWAY_PORT:18789}
+
+spring:
+  application:
+    name: openclaw-gateway
+
+# Align with Node: health/ready paths
+management:
+  endpoints:
+    web:
+      exposure:
+        include: []
+  endpoint:
+    health:
+      show-details: when_authorized
