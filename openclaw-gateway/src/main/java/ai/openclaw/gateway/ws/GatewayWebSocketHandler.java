@@ -20,6 +20,9 @@ import java.util.HashSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
@@ -75,6 +78,18 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       NODE_INVOKE_WAITERS_BY_ID = new ConcurrentHashMap<>();
   private static final ConcurrentHashMap<String, PendingNodeInvokeMeta>
       NODE_INVOKE_META_BY_ID = new ConcurrentHashMap<>();
+
+  private static final ExecutorService NODE_INVOKE_EXECUTOR =
+      Executors.newCachedThreadPool(
+          new ThreadFactory() {
+            @Override
+            public Thread newThread(Runnable r) {
+              Thread t = new Thread(r);
+              t.setDaemon(true);
+              t.setName("openclaw-node-invoke-waiter");
+              return t;
+            }
+          });
 
   private static final class PendingNodeAction {
     final String id;
@@ -730,33 +745,39 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     }
     enqueueNodeAction(nodeId, id, command, paramsJSON);
 
-    try {
-      NodeInvokeResolution resolution = waiter.get(waitTimeoutMs, TimeUnit.MILLISECONDS);
-      if (resolution.ok) {
-        Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("ok", true);
-        payload.put("nodeId", nodeId);
-        payload.put("command", command);
-        payload.put("payload", resolution.payload);
-        payload.put("payloadJSON", resolution.payloadJSON);
-        sendResponse(session, req.getId(), true, payload, null);
-      } else {
-        sendResponse(session, req.getId(), false, null, resolution.error);
-      }
-      return;
-    } catch (TimeoutException e) {
-      NODE_INVOKE_WAITERS_BY_ID.remove(id);
-      NODE_INVOKE_META_BY_ID.remove(id);
-      ErrorShape err = ErrorShape.of(ErrorCodes.AGENT_TIMEOUT, "node.invoke timeout waiting for node.invoke.result");
-      sendResponse(session, req.getId(), false, null, err);
-      return;
-    } catch (Exception e) {
-      NODE_INVOKE_WAITERS_BY_ID.remove(id);
-      NODE_INVOKE_META_BY_ID.remove(id);
-      ErrorShape err = ErrorShape.of(ErrorCodes.UNAVAILABLE, "node.invoke failed: " + e.getMessage());
-      sendResponse(session, req.getId(), false, null, err);
-      return;
-    }
+    final String responseId = req.getId();
+    NODE_INVOKE_EXECUTOR.submit(
+        () -> {
+          try {
+            NodeInvokeResolution resolution = waiter.get(waitTimeoutMs, TimeUnit.MILLISECONDS);
+            if (resolution.ok) {
+              Map<String, Object> payload = new LinkedHashMap<>();
+              payload.put("ok", true);
+              payload.put("nodeId", nodeId);
+              payload.put("command", command);
+              payload.put("payload", resolution.payload);
+              payload.put("payloadJSON", resolution.payloadJSON);
+              sendResponse(session, responseId, true, payload, null);
+            } else {
+              sendResponse(session, responseId, false, null, resolution.error);
+            }
+          } catch (TimeoutException e) {
+            NODE_INVOKE_WAITERS_BY_ID.remove(id);
+            NODE_INVOKE_META_BY_ID.remove(id);
+            ErrorShape err =
+                ErrorShape.of(
+                    ErrorCodes.AGENT_TIMEOUT,
+                    "node.invoke timeout waiting for node.invoke.result");
+            sendResponse(session, responseId, false, null, err);
+          } catch (Exception e) {
+            NODE_INVOKE_WAITERS_BY_ID.remove(id);
+            NODE_INVOKE_META_BY_ID.remove(id);
+            ErrorShape err =
+                ErrorShape.of(
+                    ErrorCodes.UNAVAILABLE, "node.invoke failed: " + e.getMessage());
+            sendResponse(session, responseId, false, null, err);
+          }
+        });
   }
 
   private void handleNodeInvokeResult(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
