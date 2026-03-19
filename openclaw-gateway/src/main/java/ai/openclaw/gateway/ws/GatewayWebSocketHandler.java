@@ -3,6 +3,7 @@ package ai.openclaw.gateway.ws;
 import ai.openclaw.config.ConfigLoader;
 import ai.openclaw.config.ConfigSnapshot;
 import ai.openclaw.config.ConfigWriter;
+import ai.openclaw.config.ConfigParsers;
 import ai.openclaw.gateway.auth.MethodScopes;
 import ai.openclaw.config.ConfigMergePatch;
 import ai.openclaw.protocol.EventFrame;
@@ -12,7 +13,6 @@ import ai.openclaw.protocol.ErrorShape;
 import ai.openclaw.protocol.RequestFrame;
 import ai.openclaw.protocol.ResponseFrame;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.JsonNode;
 import java.util.Set;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -984,11 +984,7 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
 
   @SuppressWarnings("unchecked")
   private Map<String, Object> parseJsonObject(String raw) throws Exception {
-    JsonNode node = MAPPER.readTree(raw);
-    if (node == null || !node.isObject()) {
-      throw new IllegalArgumentException("raw must be a JSON object");
-    }
-    return (Map<String, Object>) MAPPER.convertValue(node, Map.class);
+    return ConfigParsers.parseJson5Object(raw);
   }
 
   private String optionalNonEmptyString(Map<String, Object> params, String key) {

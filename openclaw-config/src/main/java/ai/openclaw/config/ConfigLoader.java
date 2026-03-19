@@ -2,6 +2,7 @@ package ai.openclaw.config;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.json5.Json5Factory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
@@ -9,11 +10,11 @@ import java.util.Map;
 
 /**
  * Loads OpenClaw config from JSON file; aligned with Node config load (simplified:
- * no JSON5, no includes, no env substitution in this first slice).
+ * no includes or env substitution in this first slice).
  */
 public final class ConfigLoader {
 
-  private static final ObjectMapper MAPPER = new ObjectMapper();
+  private static final ObjectMapper MAPPER = new ObjectMapper(new Json5Factory());
 
   private final ConfigPaths paths;
 
