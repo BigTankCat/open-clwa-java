@@ -16,6 +16,7 @@ import ai.openclaw.protocol.ResponseFrame;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.Set;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -94,11 +95,23 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
   private static final ConcurrentHashMap<String, Map<String, Object>> POLL_DEDUPE_BY_ID =
       new ConcurrentHashMap<>();
 
-  // node.pending.enqueue/node.pending.drain (status.request/location.request) work queue.
-  // Separated from node.invoke queue (node.pending.pull/ack) for parity.
-  private static final ConcurrentHashMap<String, ConcurrentLinkedQueue<PendingNodeDrainWork>>
-      NODE_DRAIN_WORK_BY_NODE_ID = new ConcurrentHashMap<>();
-  private static final AtomicLong NODE_DRAIN_REVISION = new AtomicLong(1);
+  // node.pending.enqueue/node.pending.drain (status.request/location.request) work store.
+  // Separated from node.invoke queue (node.pending.pull/ack).
+  private static final String DEFAULT_STATUS_ITEM_ID = "baseline-status";
+  private static final String DEFAULT_STATUS_PRIORITY = "default";
+  private static final String DEFAULT_WORK_PRIORITY = "normal";
+  private static final int DEFAULT_NODE_PENDING_MAX_ITEMS = 4;
+  private static final int MAX_NODE_PENDING_MAX_ITEMS = 10;
+  private static final Map<String, Integer> PRIORITY_RANK =
+      Map.of("high", 3, "normal", 2, "default", 1);
+
+  private static final class PendingNodeDrainWorkState {
+    long revision;
+    final Map<String, PendingNodeDrainWork> itemsById = new HashMap<>();
+  }
+
+  private static final ConcurrentHashMap<String, PendingNodeDrainWorkState>
+      NODE_DRAIN_STATE_BY_NODE_ID = new ConcurrentHashMap<>();
 
   private static final class PendingNodeAction {
     final String id;
@@ -930,6 +943,65 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     return out;
   }
 
+  private PendingNodeDrainWorkState getOrCreateNodeDrainState(String nodeId) {
+    return NODE_DRAIN_STATE_BY_NODE_ID.computeIfAbsent(
+        nodeId, (k) -> new PendingNodeDrainWorkState());
+  }
+
+  private boolean isNodeConnected(String nodeId) {
+    if (nodeId == null || nodeId.isBlank()) return false;
+    for (WsContext ctx : CONTEXTS_BY_CONN_ID.values()) {
+      if (ctx == null) continue;
+      if (!ctx.connected) continue;
+      if (ctx.nodeId == null) continue;
+      if (!nodeId.equals(ctx.nodeId)) continue;
+      if (ctx.role != null && "node".equalsIgnoreCase(ctx.role)) return true;
+    }
+    return false;
+  }
+
+  private boolean pruneExpiredDrainItems(PendingNodeDrainWorkState state, long nowMs) {
+    if (state == null || state.itemsById == null || state.itemsById.isEmpty()) return false;
+    boolean changed = false;
+    List<String> toRemove = new ArrayList<>();
+    for (Map.Entry<String, PendingNodeDrainWork> e : state.itemsById.entrySet()) {
+      PendingNodeDrainWork item = e.getValue();
+      if (item == null) continue;
+      if (item.expiresAtMs != null && item.expiresAtMs <= nowMs) {
+        toRemove.add(e.getKey());
+      }
+    }
+    if (!toRemove.isEmpty()) {
+      for (String id : toRemove) {
+        state.itemsById.remove(id);
+      }
+      changed = true;
+    }
+    if (changed) state.revision += 1;
+    return changed;
+  }
+
+  private List<PendingNodeDrainWork> sortedExplicitDrainItems(PendingNodeDrainWorkState state) {
+    List<PendingNodeDrainWork> items = new ArrayList<>();
+    if (state != null && state.itemsById != null && !state.itemsById.isEmpty()) {
+      items.addAll(state.itemsById.values());
+    }
+    items.sort(
+        (a, b) -> {
+          int ra = PRIORITY_RANK.getOrDefault(a.priority, 1);
+          int rb = PRIORITY_RANK.getOrDefault(b.priority, 1);
+          int pr = rb - ra; // higher first
+          if (pr != 0) return pr;
+          if (a.createdAtMs != b.createdAtMs) return Long.compare(a.createdAtMs, b.createdAtMs);
+          return a.id.compareTo(b.id);
+        });
+    return items;
+  }
+
+  private PendingNodeDrainWork makeBaselineStatusItem(long nowMs) {
+    return new PendingNodeDrainWork(DEFAULT_STATUS_ITEM_ID, "status.request", DEFAULT_STATUS_PRIORITY, nowMs, null);
+  }
+
   private void handleNodePendingDrain(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
     WsContext ctx = (WsContext) session.getAttributes().get(WsContext.KEY);
     String nodeId = ctx != null ? ctx.nodeId : null;
@@ -943,39 +1015,58 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       return;
     }
 
-    int maxItems = optionalPositiveInt(params, "maxItems", 10);
-    if (maxItems > 10) maxItems = 10;
+    int maxItems = optionalPositiveInt(params, "maxItems", DEFAULT_NODE_PENDING_MAX_ITEMS);
+    if (maxItems > MAX_NODE_PENDING_MAX_ITEMS) maxItems = MAX_NODE_PENDING_MAX_ITEMS;
     if (maxItems < 1) maxItems = 1;
 
-    ConcurrentLinkedQueue<PendingNodeDrainWork> q = NODE_DRAIN_WORK_BY_NODE_ID.get(nodeId);
     long now = System.currentTimeMillis();
-
-    // Drop expired items before draining so `hasMore` matches Node semantics.
-    if (q != null) {
-      q.removeIf((item) -> item.expiresAtMs != null && item.expiresAtMs <= now);
-    }
-    List<Map<String, Object>> items = new ArrayList<>();
-    if (q != null) {
-      for (int i = 0; i < maxItems; i++) {
-        PendingNodeDrainWork item = q.poll();
-        if (item == null) break;
-        items.add(drainWorkItemPayload(item));
-      }
+    PendingNodeDrainWorkState state = NODE_DRAIN_STATE_BY_NODE_ID.get(nodeId);
+    if (state != null) {
+      pruneExpiredDrainItems(state, now);
     }
 
-    // Parity with Node: includeDefaultStatus=true means we always return at least one item.
-    if (items.isEmpty()) {
-      PendingNodeDrainWork defaultStatus =
-          new PendingNodeDrainWork(
-              UUID.randomUUID().toString(), "status.request", "default", now, null);
-      items.add(drainWorkItemPayload(defaultStatus));
+    List<PendingNodeDrainWork> explicitItems = sortedExplicitDrainItems(state);
+    long revision = state != null ? state.revision : 0;
+
+    boolean hasExplicitStatus =
+        explicitItems.stream().anyMatch((item) -> "status.request".equals(item.type));
+    boolean includeBaseline = !hasExplicitStatus; // includeDefaultStatus=true always (this method)
+
+    // First slice: explicit items only.
+    List<PendingNodeDrainWork> items = new ArrayList<>();
+    if (explicitItems.size() <= maxItems) {
+      items.addAll(explicitItems);
+    } else {
+      items.addAll(explicitItems.subList(0, maxItems));
     }
 
-    boolean hasMore = q != null && !q.isEmpty();
+    // Then conditionally inject baseline-status if missing and there's room.
+    boolean baselineIncluded = false;
+    if (includeBaseline && items.size() < maxItems) {
+      items.add(makeBaselineStatusItem(now));
+      baselineIncluded = true;
+    }
+
+    long explicitReturnedCount =
+        items.stream().filter((item) -> !DEFAULT_STATUS_ITEM_ID.equals(item.id)).count();
+
+    if (includeBaseline && !baselineIncluded) {
+      baselineIncluded =
+          items.stream().anyMatch((item) -> DEFAULT_STATUS_ITEM_ID.equals(item.id));
+    }
+
+    boolean hasMore =
+        explicitItems.size() > explicitReturnedCount || (includeBaseline && !baselineIncluded);
+
+    List<Map<String, Object>> payloadItems = new ArrayList<>();
+    for (PendingNodeDrainWork item : items) {
+      payloadItems.add(drainWorkItemPayload(item));
+    }
+
     Map<String, Object> payload = new LinkedHashMap<>();
     payload.put("nodeId", nodeId);
-    payload.put("revision", NODE_DRAIN_REVISION.get());
-    payload.put("items", items);
+    payload.put("revision", revision);
+    payload.put("items", payloadItems);
     payload.put("hasMore", hasMore);
     sendResponse(session, req.getId(), true, payload, null);
   }
@@ -1006,8 +1097,8 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     }
 
     String priorityRaw = optionalNonEmptyString(params, "priority");
-    String priority = priorityRaw != null ? priorityRaw : "default";
-    if (!"default".equals(priority) && !"normal".equals(priority) && !"high".equals(priority)) {
+    String priority = priorityRaw != null ? priorityRaw : DEFAULT_WORK_PRIORITY;
+    if (!"normal".equals(priority) && !"high".equals(priority)) {
       sendResponse(
           session,
           req.getId(),
@@ -1032,23 +1123,44 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
               ErrorCodes.INVALID_REQUEST, "node.pending.enqueue: expiresInMs out of range"));
       return;
     }
-    Long expiresAtMs = expiresInMs != null ? now + expiresInMs : null;
 
-    PendingNodeDrainWork item =
-        new PendingNodeDrainWork(UUID.randomUUID().toString(), type, priority, now, expiresAtMs);
-    ConcurrentLinkedQueue<PendingNodeDrainWork> q =
-        NODE_DRAIN_WORK_BY_NODE_ID.computeIfAbsent(nodeId, (k) -> new ConcurrentLinkedQueue<>());
-    q.add(item);
+    Long expiresAtMs = null;
+    if (expiresInMs != null) {
+      expiresAtMs = now + Math.max(1_000, Math.trunc(expiresInMs));
+    }
 
-    long revision = NODE_DRAIN_REVISION.incrementAndGet();
+    PendingNodeDrainWorkState state = getOrCreateNodeDrainState(nodeId);
+    pruneExpiredDrainItems(state, now);
 
-    // wakeTriggered: Node would try APNS wake; this Java slice doesn't integrate with wake.
-    Map<String, Object> queued = drainWorkItemPayload(item);
+    PendingNodeDrainWork existing =
+        state.itemsById.values().stream()
+            .filter((item) -> item != null && type.equals(item.type))
+            .findFirst()
+            .orElse(null);
+
+    boolean deduped = existing != null;
+    PendingNodeDrainWork queuedItem;
+    long revision;
+    if (deduped) {
+      queuedItem = existing;
+      revision = state.revision;
+    } else {
+      queuedItem =
+          new PendingNodeDrainWork(
+              UUID.randomUUID().toString(), type, priority, now, expiresAtMs);
+      state.itemsById.put(queuedItem.id, queuedItem);
+      state.revision += 1;
+      revision = state.revision;
+    }
+
+    boolean wakeTriggered = wake && !deduped && !isNodeConnected(nodeId);
+
+    Map<String, Object> queued = drainWorkItemPayload(queuedItem);
     Map<String, Object> payload = new LinkedHashMap<>();
     payload.put("nodeId", nodeId);
     payload.put("revision", revision);
     payload.put("queued", queued);
-    payload.put("wakeTriggered", false);
+    payload.put("wakeTriggered", wakeTriggered);
     sendResponse(session, req.getId(), true, payload, null);
   }
 
