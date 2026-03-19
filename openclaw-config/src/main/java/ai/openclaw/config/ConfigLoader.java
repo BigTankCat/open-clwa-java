@@ -6,6 +6,7 @@ import com.fasterxml.jackson.dataformat.json5.Json5Factory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Map;
 
 /**
@@ -36,7 +37,34 @@ public final class ConfigLoader {
       Map<String, Object> map = root == null || !root.isObject()
           ? Collections.emptyMap()
           : MAPPER.convertValue(root, ConfigSnapshot.MAP_TYPE);
-      return new ConfigSnapshot(file.toString(), map, true);
+
+      // 1) Resolve $include recursively.
+      ConfigIncludes includes = new ConfigIncludes(MAPPER);
+      Object withIncludes = includes.resolveIncludes(map, file);
+
+      // 2) Apply ${ENV} substitution.
+      @SuppressWarnings("unchecked")
+      Map<String, Object> resolved = (Map<String, Object>) withIncludes;
+
+      Map<String, String> env = new HashMap<>(System.getenv());
+      // Apply config-defined env vars before substitution.
+      Object envObj = resolved.get("env");
+      if (envObj instanceof Map<?, ?> envMap) {
+        for (Map.Entry<?, ?> e : envMap.entrySet()) {
+          if (!(e.getKey() instanceof String k)) continue;
+          Object v = e.getValue();
+          if (v == null) continue;
+          env.put(k, String.valueOf(v));
+        }
+      }
+
+      Object substituted =
+          ConfigEnvSubstitutor.substituteConfigEnvVars(
+              resolved, env, (msg) -> System.err.println(msg));
+      @SuppressWarnings("unchecked")
+      Map<String, Object> substitutedMap = (Map<String, Object>) substituted;
+
+      return new ConfigSnapshot(file.toString(), substitutedMap, true);
     } catch (Exception e) {
       throw new ConfigLoadException("Failed to load config from " + file, e);
     }
