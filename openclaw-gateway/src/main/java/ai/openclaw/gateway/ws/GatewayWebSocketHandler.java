@@ -948,6 +948,12 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     if (maxItems < 1) maxItems = 1;
 
     ConcurrentLinkedQueue<PendingNodeDrainWork> q = NODE_DRAIN_WORK_BY_NODE_ID.get(nodeId);
+    long now = System.currentTimeMillis();
+
+    // Drop expired items before draining so `hasMore` matches Node semantics.
+    if (q != null) {
+      q.removeIf((item) -> item.expiresAtMs != null && item.expiresAtMs <= now);
+    }
     List<Map<String, Object>> items = new ArrayList<>();
     if (q != null) {
       for (int i = 0; i < maxItems; i++) {
@@ -959,7 +965,6 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
 
     // Parity with Node: includeDefaultStatus=true means we always return at least one item.
     if (items.isEmpty()) {
-      long now = System.currentTimeMillis();
       PendingNodeDrainWork defaultStatus =
           new PendingNodeDrainWork(
               UUID.randomUUID().toString(), "status.request", "default", now, null);
@@ -1017,6 +1022,16 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     boolean wake = wakeObj == null || wakeObj;
 
     long now = System.currentTimeMillis();
+    if (expiresInMs != null && (expiresInMs < 1_000 || expiresInMs > 86_400_000)) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(
+              ErrorCodes.INVALID_REQUEST, "node.pending.enqueue: expiresInMs out of range"));
+      return;
+    }
     Long expiresAtMs = expiresInMs != null ? now + expiresInMs : null;
 
     PendingNodeDrainWork item =
