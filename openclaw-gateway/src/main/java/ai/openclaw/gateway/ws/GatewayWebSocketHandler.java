@@ -28,6 +28,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -51,6 +52,164 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
   private static final Set<String> EVENT_SLOTS =
       Set.of("sessions.changed", "sessions.messages");
 
+  // Align with Node server-methods-list.ts:
+  // - BASE_METHODS are advertised in hello-ok.features.methods.
+  // - GATEWAY_EVENTS are advertised in hello-ok.features.events.
+  private static final List<String> NODE_BASE_METHODS =
+      List.of(
+          "health",
+          "doctor.memory.status",
+          "logs.tail",
+          "channels.status",
+          "channels.logout",
+          "status",
+          "usage.status",
+          "usage.cost",
+          "tts.status",
+          "tts.providers",
+          "tts.enable",
+          "tts.disable",
+          "tts.convert",
+          "tts.setProvider",
+          "config.get",
+          "config.set",
+          "config.apply",
+          "config.patch",
+          "config.schema",
+          "config.schema.lookup",
+          "exec.approvals.get",
+          "exec.approvals.set",
+          "exec.approvals.node.get",
+          "exec.approvals.node.set",
+          "exec.approval.request",
+          "exec.approval.waitDecision",
+          "exec.approval.resolve",
+          "wizard.start",
+          "wizard.next",
+          "wizard.cancel",
+          "wizard.status",
+          "talk.config",
+          "talk.mode",
+          "models.list",
+          "tools.catalog",
+          "agents.list",
+          "agents.create",
+          "agents.update",
+          "agents.delete",
+          "agents.files.list",
+          "agents.files.get",
+          "agents.files.set",
+          "skills.status",
+          "skills.bins",
+          "skills.install",
+          "skills.update",
+          "update.run",
+          "voicewake.get",
+          "voicewake.set",
+          "secrets.reload",
+          "secrets.resolve",
+          "sessions.list",
+          "sessions.subscribe",
+          "sessions.unsubscribe",
+          "sessions.messages.subscribe",
+          "sessions.messages.unsubscribe",
+          "sessions.preview",
+          "sessions.create",
+          "sessions.send",
+          "sessions.abort",
+          "sessions.patch",
+          "sessions.reset",
+          "sessions.delete",
+          "sessions.compact",
+          "last-heartbeat",
+          "set-heartbeats",
+          "wake",
+          "node.pair.request",
+          "node.pair.list",
+          "node.pair.approve",
+          "node.pair.reject",
+          "node.pair.verify",
+          "device.pair.list",
+          "device.pair.approve",
+          "device.pair.reject",
+          "device.pair.remove",
+          "device.token.rotate",
+          "device.token.revoke",
+          "node.rename",
+          "node.list",
+          "node.describe",
+          "node.pending.drain",
+          "node.pending.enqueue",
+          "node.invoke",
+          "node.pending.pull",
+          "node.pending.ack",
+          "node.invoke.result",
+          "node.event",
+          "node.canvas.capability.refresh",
+          "cron.list",
+          "cron.status",
+          "cron.add",
+          "cron.update",
+          "cron.remove",
+          "cron.run",
+          "cron.runs",
+          "gateway.identity.get",
+          "system-presence",
+          "system-event",
+          "send",
+          "agent",
+          "agent.identity.get",
+          "agent.wait",
+          "browser.request",
+          "chat.history",
+          "chat.abort",
+          "chat.send");
+
+  // Note: Node base methods list doesn't include `poll` (it is implemented as a gateway
+  // method, but not part of base feature negotiation). We still advertise it for compatibility.
+  private static final String POLL_METHOD = "poll";
+
+  private static final List<String> NODE_GATEWAY_EVENTS =
+      List.of(
+          "connect.challenge",
+          "agent",
+          "chat",
+          "session.message",
+          "session.tool",
+          "sessions.changed",
+          "presence",
+          "tick",
+          "talk.mode",
+          "shutdown",
+          "health",
+          "heartbeat",
+          "cron",
+          "node.pair.requested",
+          "node.pair.resolved",
+          "device.pair.requested",
+          "device.pair.resolved",
+          "voicewake.changed",
+          "exec.approval.requested",
+          "exec.approval.resolved",
+          "update.available");
+
+  private static final List<String> FEATURE_METHODS;
+  private static final Set<String> FEATURE_METHODS_SET;
+  private static final List<String> FEATURE_EVENTS;
+
+  static {
+    LinkedHashSet<String> methods = new LinkedHashSet<>(NODE_BASE_METHODS);
+    methods.add("connect");
+    methods.add(POLL_METHOD);
+    FEATURE_METHODS = List.copyOf(methods);
+    FEATURE_METHODS_SET = Set.copyOf(methods);
+
+    LinkedHashSet<String> events = new LinkedHashSet<>(NODE_GATEWAY_EVENTS);
+    // Java port emits/declares these transcript events.
+    events.addAll(EVENT_SLOTS);
+    FEATURE_EVENTS = List.copyOf(events);
+  }
+
   private static final ConcurrentHashMap<String, WebSocketSession> ACTIVE_SESSIONS =
       new ConcurrentHashMap<>();
 
@@ -59,6 +218,8 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
 
   @Value("${openclaw.version:2026.3.14}")
   private String version;
+
+  private final long startedAtMs = System.currentTimeMillis();
 
   private final ConfigLoader configLoader;
   private final String gatewayToken;
@@ -307,12 +468,21 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
 
       WsMethodHandler handler = methodHandlers.get(method);
       if (handler == null) {
-        sendResponse(
-            session,
-            req.getId(),
-            false,
-            null,
-            ErrorShape.of(ErrorCodes.INVALID_REQUEST, "unknown method: " + method));
+        if (FEATURE_METHODS_SET.contains(method)) {
+          sendResponse(
+              session,
+              req.getId(),
+              false,
+              null,
+              ErrorShape.of(ErrorCodes.UNAVAILABLE, "method not implemented: " + method));
+        } else {
+          sendResponse(
+              session,
+              req.getId(),
+              false,
+              null,
+              ErrorShape.of(ErrorCodes.INVALID_REQUEST, "unknown method: " + method));
+        }
         return;
       }
       handler.handle(session, req, params);
@@ -337,44 +507,60 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     if (ctx.scopes == null) {
       ctx.scopes = List.of(MethodScopes.READ_SCOPE, MethodScopes.WRITE_SCOPE, MethodScopes.ADMIN_SCOPE);
     }
-    Map<String, Object> hello = Map.of(
-        "type", "hello-ok",
-        "protocol", 1,
-        "server", Map.of("version", version, "connId", ctx.connId),
+
+    // Node snapshot schema expects required fields:
+    // presence, health, stateVersion, uptimeMs.
+    Map<String, Object> snapshot = new LinkedHashMap<>();
+    snapshot.put("presence", List.of());
+    snapshot.put("health", healthPayload());
+    snapshot.put("stateVersion", Map.of("presence", 0, "health", 0));
+    snapshot.put("uptimeMs", Math.max(0, System.currentTimeMillis() - startedAtMs));
+    snapshot.put("configPath", configWriter.getConfigPath());
+    snapshot.put("stateDir", configLoader.getPaths().getStateDir());
+
+    // HelloOkSchema.auth is optional, but if present it must include non-empty `deviceToken`.
+    String deviceToken = deviceTokenFromConnectParams(params);
+    Map<String, Object> auth = null;
+    if (deviceToken != null) {
+      auth =
+          new LinkedHashMap<>(
+              Map.of(
+                  "deviceToken", deviceToken,
+                  "role", ctx.role,
+                  "scopes", ctx.scopes));
+      // issuedAtMs is optional in schema; omit for now to keep payload minimal.
+    }
+
+    Map<String, Object> hello = new LinkedHashMap<>();
+    hello.put("type", "hello-ok");
+    hello.put("protocol", 1);
+    hello.put("server", Map.of("version", version, "connId", ctx.connId));
+    hello.put(
         "features",
-            Map.of(
-                "methods",
-                List.of(
-                    "health",
-                    "poll",
-                    "config.get",
-                    "config.apply",
-                    "config.patch",
-                    "sessions.create",
-                    "sessions.list",
-                    "sessions.get",
-                    "sessions.delete",
-                    "sessions.subscribe",
-                    "sessions.unsubscribe",
-                    "sessions.messages.subscribe",
-                    "sessions.messages.unsubscribe",
-                    "chat.send",
-                    "node.invoke",
-                    "node.invoke.result",
-                    "node.event",
-                    "node.pending.drain",
-                    "node.pending.pull",
-                    "node.pending.ack",
-                    "node.pending.enqueue",
-                    "status",
-                    "connect"),
-                "events",
-                EVENT_SLOTS.stream().toList()),
-        "snapshot", Map.of("health", healthPayload()),
-        "policy", Map.of("maxPayload", 25 * 1024 * 1024, "maxBufferedBytes", 50 * 1024 * 1024, "tickIntervalMs", 30_000),
-        "auth", Map.of("role", ctx.role, "scopes", ctx.scopes));
+        Map.of("methods", FEATURE_METHODS, "events", FEATURE_EVENTS));
+    hello.put("snapshot", snapshot);
+    hello.put(
+        "policy",
+        Map.of(
+            "maxPayload", 25 * 1024 * 1024,
+            "maxBufferedBytes", 50 * 1024 * 1024,
+            "tickIntervalMs", 30_000));
+    if (auth != null) {
+      hello.put("auth", auth);
+    }
     send(session, hello);
     sendResponse(session, req.getId(), true, Map.of("ok", true), null);
+  }
+
+  @SuppressWarnings("unchecked")
+  private String deviceTokenFromConnectParams(Map<String, Object> params) {
+    if (params == null) return null;
+    Object auth = params.get("auth");
+    if (!(auth instanceof Map)) return null;
+    Object dt = ((Map<String, Object>) auth).get("deviceToken");
+    if (!(dt instanceof String s)) return null;
+    String trimmed = s.trim();
+    return trimmed.isEmpty() ? null : trimmed;
   }
 
   @SuppressWarnings("unchecked")
