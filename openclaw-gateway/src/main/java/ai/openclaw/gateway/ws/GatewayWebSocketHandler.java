@@ -548,8 +548,8 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     if (auth != null) {
       hello.put("auth", auth);
     }
-    send(session, hello);
-    sendResponse(session, req.getId(), true, Map.of("ok", true), null);
+    // Node behavior: connect (req) response payload is `hello-ok`.
+    sendResponse(session, req.getId(), true, hello, null);
   }
 
   @SuppressWarnings("unchecked")
