@@ -121,6 +121,22 @@ public class InMemorySessionStore {
     persistMeta(entry);
   }
 
+  /**
+   * Append a structured trace event to the session transcript jsonl.
+   *
+   * <p>This is intended for debugging "execution records" and model interaction
+   * payloads. The existing {@link #listMessages} API stays string-only for
+   * compatibility with earlier slices.
+   */
+  public void addEvent(String key, String eventType, Object payload) {
+    SessionEntry entry = sessions.get(key);
+    if (entry == null) return;
+    long now = System.currentTimeMillis();
+    entry.updatedAt = now;
+    appendEventLine(entry, eventType, payload, now);
+    persistMeta(entry);
+  }
+
   public List<String> listMessages(String key, int limit) {
     SessionEntry entry = sessions.get(key);
     if (entry == null) return List.of();
@@ -129,6 +145,29 @@ public class InMemorySessionStore {
       int size = entry.messages.size();
       int start = Math.max(0, size - limit);
       return new ArrayList<>(entry.messages.subList(start, size));
+    }
+  }
+
+  public List<Map<String, Object>> listTrace(String key, int limit) {
+    if (limit <= 0) return List.of();
+    Path file = transcriptPathForKey(key);
+    if (!Files.isRegularFile(file)) return List.of();
+
+    try {
+      List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+      if (lines.isEmpty()) return List.of();
+      int start = Math.max(0, lines.size() - limit);
+      List<Map<String, Object>> out = new ArrayList<>();
+      for (int i = start; i < lines.size(); i++) {
+        String trimmed = lines.get(i).trim();
+        if (trimmed.isEmpty()) continue;
+        Map<String, Object> obj = MAPPER.readValue(trimmed, Map.class);
+        out.add(obj);
+      }
+      return out;
+    } catch (Exception e) {
+      // Fail softly: return empty trace if transcript is corrupted.
+      return List.of();
     }
   }
 
@@ -300,6 +339,29 @@ public class InMemorySessionStore {
           StandardOpenOption.APPEND);
     } catch (Exception e) {
       throw new RuntimeException("Failed to append transcript for key=" + entry.key, e);
+    } finally {
+      ioLock.unlock();
+    }
+  }
+
+  private void appendEventLine(SessionEntry entry, String eventType, Object payload, long now) {
+    ioLock.lock();
+    try {
+      Files.createDirectories(transcriptsDir);
+      Map<String, Object> line = new LinkedHashMap<>();
+      line.put("ts", now);
+      line.put("event", eventType);
+      line.put("payload", payload);
+      String json = MAPPER.writeValueAsString(line);
+      Files.writeString(
+          transcriptPathForKey(entry.key),
+          json + "\n",
+          StandardCharsets.UTF_8,
+          StandardOpenOption.CREATE,
+          StandardOpenOption.WRITE,
+          StandardOpenOption.APPEND);
+    } catch (Exception e) {
+      throw new RuntimeException("Failed to append trace for key=" + entry.key, e);
     } finally {
       ioLock.unlock();
     }

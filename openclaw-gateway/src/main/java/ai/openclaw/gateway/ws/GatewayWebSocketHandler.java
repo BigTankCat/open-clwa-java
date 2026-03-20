@@ -293,10 +293,12 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
   private static final class PendingNodeInvokeMeta {
     final String nodeId;
     final String command;
+    final String sessionKey;
 
-    PendingNodeInvokeMeta(String nodeId, String command) {
+    PendingNodeInvokeMeta(String nodeId, String command, String sessionKey) {
       this.nodeId = nodeId;
       this.command = command;
+      this.sessionKey = sessionKey;
     }
   }
 
@@ -921,6 +923,13 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     // Push events to subscribers.
     emitSessionsChanged(sessionKey, "send");
     emitSessionsMessage(sessionKey, messageSeq, message);
+
+    // Record execution trace for UI debugging.
+    Map<String, Object> tracePayload = new LinkedHashMap<>();
+    tracePayload.put("messageSeq", messageSeq);
+    tracePayload.put("message", message);
+    tracePayload.put("ts", System.currentTimeMillis());
+    sessionStore.addEvent(sessionKey, "chat.send", tracePayload);
   }
 
   private void handlePoll(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
@@ -1024,10 +1033,23 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
 
     CompletableFuture<NodeInvokeResolution> waiter = new CompletableFuture<>();
     NODE_INVOKE_WAITERS_BY_ID.put(id, waiter);
-    NODE_INVOKE_META_BY_ID.put(id, new PendingNodeInvokeMeta(nodeId, command));
+    String sessionKey = optionalNonEmptyString(params, "sessionKey");
 
     Object rawParams = params.get("params");
     String paramsJSON = null;
+    // Support passing `sessionKey` inside the opaque `params` blob as a convenience.
+    if (sessionKey == null && rawParams instanceof Map<?, ?> m) {
+      Object sk = m.get("sessionKey");
+      if (sk instanceof String s) {
+        String trimmed = s.trim();
+        if (!trimmed.isEmpty()) sessionKey = trimmed;
+      }
+    }
+    if (sessionKey == null) {
+      sessionKey = optionalNonEmptyString(params, "taskSessionKey");
+    }
+
+    NODE_INVOKE_META_BY_ID.put(id, new PendingNodeInvokeMeta(nodeId, command, sessionKey));
     if (rawParams != null) {
       try {
         paramsJSON = MAPPER.writeValueAsString(rawParams);
@@ -1095,13 +1117,25 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     }
 
     CompletableFuture<NodeInvokeResolution> waiter = NODE_INVOKE_WAITERS_BY_ID.remove(id);
-    NODE_INVOKE_META_BY_ID.remove(id);
+    PendingNodeInvokeMeta meta = NODE_INVOKE_META_BY_ID.remove(id);
     if (waiter == null) {
       // Late-arriving result expected: return success and mark ignored.
       Map<String, Object> payload = new LinkedHashMap<>();
       payload.put("ok", true);
       payload.put("ignored", true);
       sendResponse(session, req.getId(), true, payload, null);
+
+      if (meta != null && meta.sessionKey != null) {
+        Map<String, Object> tracePayload = new LinkedHashMap<>();
+        tracePayload.put("id", id);
+        tracePayload.put("nodeId", nodeId);
+        tracePayload.put("command", meta.command);
+        tracePayload.put("ok", ok);
+        tracePayload.put("payload", params.get("payload"));
+        tracePayload.put("payloadJSON", optionalNonEmptyString(params, "payloadJSON"));
+        tracePayload.put("ts", System.currentTimeMillis());
+        sessionStore.addEvent(meta.sessionKey, "node.invoke.result", tracePayload);
+      }
       return;
     }
 
@@ -1114,6 +1148,19 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     waiter.complete(new NodeInvokeResolution(ok, payloadObj, payloadJSON, err));
 
     sendResponse(session, req.getId(), true, Map.of("ok", true), null);
+
+    if (meta != null && meta.sessionKey != null) {
+      Map<String, Object> tracePayload = new LinkedHashMap<>();
+      tracePayload.put("id", id);
+      tracePayload.put("nodeId", nodeId);
+      tracePayload.put("command", meta.command);
+      tracePayload.put("ok", ok);
+      tracePayload.put("payload", payloadObj);
+      tracePayload.put("payloadJSON", payloadJSON);
+      tracePayload.put("error", err != null ? Map.of("code", err.getCode(), "message", err.getMessage()) : null);
+      tracePayload.put("ts", System.currentTimeMillis());
+      sessionStore.addEvent(meta.sessionKey, "node.invoke.result", tracePayload);
+    }
   }
 
   private void handleNodeEvent(WebSocketSession session, RequestFrame req, Map<String, Object> params) {

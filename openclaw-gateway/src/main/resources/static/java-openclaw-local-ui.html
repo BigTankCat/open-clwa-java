@@ -185,6 +185,12 @@
         Last task payload:
         <code id="taskResult">-</code>
       </div>
+      <div class="row" style="margin-top: 10px;">
+        <button id="btnRefreshTrace">Refresh Trace</button>
+        <span class="muted">show sessions/{'{key}'}/trace</span>
+      </div>
+      <div class="muted">Trace (latest 200 items):</div>
+      <pre class="log" id="trace"></pre>
     </div>
 
     <div class="card">
@@ -195,6 +201,7 @@
     <script>
       const $ = (id) => document.getElementById(id);
       const logEl = $("log");
+      const traceEl = $("trace");
       function log(msg) {
         const line = `[${new Date().toISOString()}] ${msg}`;
         console.log(line);
@@ -264,6 +271,45 @@
           const err = res && res.error ? JSON.stringify(res.error) : String(res);
           throw new Error(`${ctx} failed: ${err}`);
         }
+      }
+
+      function httpBaseFromWs(wsUrl) {
+        try {
+          const u = new URL(wsUrl);
+          const scheme = u.protocol === "wss:" ? "https:" : "http:";
+          return scheme + "//" + u.host;
+        } catch {
+          return "";
+        }
+      }
+
+      async function refreshTrace() {
+        if (!sessionKey) return;
+        const wsUrl = $("gatewayUrl").value.trim();
+        const base = httpBaseFromWs(wsUrl);
+        if (!base) {
+          traceEl.textContent = "cannot derive http base from gatewayUrl";
+          return;
+        }
+        const token = $("token").value.trim();
+        const headers = token ? { Authorization: "Bearer " + token } : {};
+        const url = `${base}/sessions/${encodeURIComponent(sessionKey)}/trace?limit=200`;
+        const res = await fetch(url, { headers });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          traceEl.textContent = "trace fetch failed: " + JSON.stringify(body);
+          return;
+        }
+        const items = body.items ?? [];
+        traceEl.textContent = JSON.stringify(
+          {
+            count: body.count,
+            hasMore: body.hasMore,
+            items,
+          },
+          null,
+          2,
+        );
       }
 
       function tokenAuth() {
@@ -398,6 +444,7 @@
         // Subscribe to message transcript events.
         await rpc(op, "sessions.messages.subscribe", { key: sessionKey }, 8000);
         log("subscribed: sessions.messages for sessionKey=" + sessionKey);
+        await refreshTrace().catch((e) => log("refreshTrace error: " + String(e)));
       }
 
       async function chatSend() {
@@ -442,6 +489,7 @@
           {
             nodeId,
             command,
+            sessionKey,
             params,
             timeoutMs: 5000,
             idempotencyKey,
@@ -451,6 +499,7 @@
         expectOk(res, "node.invoke");
         $("taskResult").textContent = JSON.stringify(res.payload?.payload ?? {});
         log("node.invoke ok payload=" + JSON.stringify(res.payload?.payload ?? {}));
+        await refreshTrace().catch((e) => log("refreshTrace error: " + String(e)));
       }
 
       $("btnConnectOperator").addEventListener("click", async () => {
@@ -500,6 +549,14 @@
           await taskInvoke();
         } catch (e) {
           log("node.invoke error: " + String(e));
+        }
+      });
+
+      $("btnRefreshTrace").addEventListener("click", async () => {
+        try {
+          await refreshTrace();
+        } catch (e) {
+          log("refreshTrace error: " + String(e));
         }
       });
     </script>

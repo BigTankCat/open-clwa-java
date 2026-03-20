@@ -74,6 +74,31 @@ public class SessionsHttpController {
     return ResponseEntity.ok(res);
   }
 
+  @GetMapping("/sessions/{key}/trace")
+  public ResponseEntity<Map<String, Object>> trace(
+      @PathVariable("key") String key,
+      @RequestHeader(value = "Authorization", required = false) String authorization,
+      @RequestParam(value = "limit", required = false) Integer limit) {
+    if (!authorized(authorization)) {
+      return ResponseEntity.status(HttpStatus.FORBIDDEN)
+          .body(error("forbidden", "invalid or missing bearer token"));
+    }
+
+    if (sessionStore.get(key) == null) {
+      return ResponseEntity.status(HttpStatus.NOT_FOUND).body(notFound(key));
+    }
+
+    int effectiveLimit = (limit == null || limit < 1) ? 200 : Math.min(200, limit);
+    List<Map<String, Object>> items = sessionStore.listTrace(key, effectiveLimit);
+
+    Map<String, Object> res = new LinkedHashMap<>();
+    res.put("sessionKey", key);
+    res.put("items", items);
+    res.put("count", items.size());
+    res.put("hasMore", false);
+    return ResponseEntity.ok(res);
+  }
+
   private boolean authorized(String authorizationHeader) {
     if (gatewayToken == null || gatewayToken.isBlank()) {
       // Token not configured -> allow (development first slice).
