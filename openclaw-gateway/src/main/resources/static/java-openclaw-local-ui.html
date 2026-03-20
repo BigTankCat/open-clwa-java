@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenClaw Java Local UI</title>
+    <style>
+      body {
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica,
+          Arial, "Apple Color Emoji", "Segoe UI Emoji";
+        margin: 18px;
+        max-width: 980px;
+      }
+      .row {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        align-items: center;
+        margin-bottom: 10px;
+      }
+      input,
+      textarea {
+        padding: 8px;
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        font-size: 14px;
+      }
+      textarea {
+        min-height: 90px;
+        width: 420px;
+      }
+      button {
+        padding: 9px 12px;
+        border-radius: 10px;
+        border: 1px solid #ddd;
+        background: #f7f7f7;
+        cursor: pointer;
+      }
+      button.primary {
+        background: #1f6feb;
+        color: white;
+        border-color: #1f6feb;
+      }
+      .card {
+        border: 1px solid #eee;
+        border-radius: 12px;
+        padding: 14px;
+        margin-bottom: 14px;
+      }
+      .muted {
+        color: #666;
+        font-size: 12px;
+      }
+      pre.log {
+        background: #0b1020;
+        color: #d6e4ff;
+        padding: 12px;
+        border-radius: 12px;
+        overflow: auto;
+        max-height: 240px;
+        white-space: pre-wrap;
+      }
+      .status {
+        font-size: 12px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        border: 1px solid #eee;
+        background: #fafafa;
+      }
+      .grid2 {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+      }
+      @media (max-width: 900px) {
+        .grid2 {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <h2>OpenClaw Java Local UI</h2>
+    <div class="muted">
+      这是为 Java 网关提供的最小本地网页：支持 connect/会话创建/聊天，以及用
+      node.invoke/node.pending.pull 回传来“布置任务”。
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <label>
+          Gateway WS URL:
+          <input id="gatewayUrl" value="ws://127.0.0.1:18789/ws" style="min-width: 320px" />
+        </label>
+        <label>
+          Token (可选):
+          <input id="token" placeholder="OPENCLAW_GATEWAY_TOKEN" style="min-width: 220px" />
+        </label>
+      </div>
+      <div class="row">
+        <button class="primary" id="btnConnectOperator">Connect Operator</button>
+        <button id="btnConnectNode">Connect Node Simulator</button>
+        <span class="status" id="opStatus">operator: disconnected</span>
+        <span class="status" id="nodeStatus">node: disconnected</span>
+      </div>
+      <div class="muted">
+        Java gateway 在握手时只检查 connect.params.auth.token/password。若你配置了
+        <code>OPENCLAW_GATEWAY_TOKEN</code>，这里必须填相同 token。
+      </div>
+    </div>
+
+    <div class="card grid2">
+      <div>
+        <h3>Create Session</h3>
+        <div class="row">
+          <label>
+            agentId:
+            <input id="agentId" value="default" />
+          </label>
+          <label>
+            label:
+            <input id="label" value="local" />
+          </label>
+        </div>
+        <div class="row">
+          <label>
+            model:
+            <input id="model" value="unknown" />
+          </label>
+        </div>
+        <div class="row">
+          <label style="flex: 1">
+            initial message:
+            <input id="initMessage" style="width: 100%" value="hello from java local ui" />
+          </label>
+        </div>
+        <div class="row">
+          <button class="primary" id="btnCreateSession">Create + Subscribe</button>
+        </div>
+        <div class="muted">
+          sessionKey:
+          <code id="sessionKey">-</code>
+        </div>
+      </div>
+
+      <div>
+        <h3>Chat</h3>
+        <div class="row">
+          <label style="flex: 1">
+            message:
+            <input id="chatMessage" style="width: 100%" value="第二条消息（operator 发起）" />
+          </label>
+        </div>
+        <div class="row">
+          <button class="primary" id="btnChatSend">Send chat.send</button>
+          <button id="btnRefreshHistory">sessions.get (quick)</button>
+        </div>
+        <div class="muted">events-driven: 订阅 sessions.messages 后会自动显示。</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>布置任务 (node.invoke)</h3>
+      <div class="row">
+        <label>
+          nodeId:
+          <input id="nodeId" value="node-1" />
+        </label>
+        <label style="flex: 1">
+          command:
+          <input id="taskCommand" value="test.command" style="width: 100%" />
+        </label>
+      </div>
+      <div class="row">
+        <label>
+          params (JSON):
+          <textarea id="taskParams">{}</textarea>
+        </label>
+      </div>
+      <div class="row">
+        <button class="primary" id="btnTaskInvoke">Invoke node.invoke</button>
+        <span class="muted" id="taskHint">operator 发起；浏览器的 node simulator 会回 node.invoke.result</span>
+      </div>
+      <div class="muted">
+        Last task payload:
+        <code id="taskResult">-</code>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Log</h3>
+      <pre class="log" id="log"></pre>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const logEl = $("log");
+      function log(msg) {
+        const line = `[${new Date().toISOString()}] ${msg}`;
+        console.log(line);
+        logEl.textContent += line + "\n";
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      const op = { ws: null, connected: false, pending: new Map() };
+      const nodeSim = { ws: null, connected: false, pending: new Map() };
+      let sessionKey = null;
+
+      function uuid() {
+        if (crypto && crypto.randomUUID) return crypto.randomUUID();
+        return Math.random().toString(16).slice(2) + "-" + Date.now();
+      }
+
+      function connectWs(target, url, onEvent) {
+        return new Promise((resolve, reject) => {
+          const ws = new WebSocket(url);
+          ws.addEventListener("open", () => {
+            target.ws = ws;
+            resolve();
+          });
+          ws.addEventListener("message", (ev) => {
+            const obj = JSON.parse(String(ev.data ?? ""));
+            if (obj && obj.type === "res" && obj.id) {
+              const p = target.pending.get(obj.id);
+              if (p) {
+                target.pending.delete(obj.id);
+                p.resolve(obj);
+              }
+              return;
+            }
+            if (obj && obj.type === "event" && onEvent) onEvent(obj);
+          });
+          ws.addEventListener("close", () => {
+            target.connected = false;
+          });
+          ws.addEventListener("error", reject);
+        });
+      }
+
+      function rpc(target, method, params, timeoutMs = 8000) {
+        const id = uuid();
+        const req = { type: "req", id, method, params: params ?? {} };
+        return new Promise((resolve, reject) => {
+          const t = setTimeout(() => {
+            target.pending.delete(id);
+            reject(new Error("timeout waiting for res: " + method));
+          }, timeoutMs);
+          target.pending.set(id, {
+            resolve: (res) => {
+              clearTimeout(t);
+              resolve(res);
+            },
+            reject: (err) => {
+              clearTimeout(t);
+              reject(err);
+            },
+          });
+          target.ws.send(JSON.stringify(req));
+        });
+      }
+
+      function expectOk(res, ctx) {
+        if (!res || res.ok !== true) {
+          const err = res && res.error ? JSON.stringify(res.error) : String(res);
+          throw new Error(`${ctx} failed: ${err}`);
+        }
+      }
+
+      function tokenAuth() {
+        const token = $("token").value.trim();
+        return token ? { token } : {};
+      }
+
+      async function connectOperator() {
+        $("opStatus").textContent = "operator: connecting...";
+        const url = $("gatewayUrl").value.trim();
+        await connectWs(op, url, (evt) => {
+          if (evt.event === "sessions.messages") {
+            const payload = evt.payload || {};
+            const msg = payload.message?.text ?? "";
+            const seq = payload.messageSeq ?? payload.message?.seq ?? "";
+            log(`event sessions.messages: seq=${seq} text=${msg}`);
+          }
+        });
+        op.connected = true;
+        $("opStatus").textContent = "operator: connected (ws)";
+
+        const helloRes = await rpc(
+          op,
+          "connect",
+          {
+            client: { id: "webchat", version: "1.0.0", platform: "local", mode: "test" },
+            minProtocol: 1,
+            maxProtocol: 1,
+            role: "operator",
+            scopes: [
+              "operator.admin",
+              "operator.read",
+              "operator.write",
+              "operator.approvals",
+              "operator.pairing",
+            ],
+            device: { id: "operator-1" },
+            auth: tokenAuth(),
+          },
+          8000,
+        );
+        expectOk(helloRes, "connect operator");
+        log("operator connected: hello-ok received");
+      }
+
+      async function connectNodeSim() {
+        $("nodeStatus").textContent = "node: connecting...";
+        const url = $("gatewayUrl").value.trim();
+        await connectWs(nodeSim, url, null);
+        nodeSim.connected = true;
+        $("nodeStatus").textContent = "node: connected (ws)";
+
+        const nodeId = $("nodeId").value.trim() || "node-1";
+        const helloRes = await rpc(
+          nodeSim,
+          "connect",
+          {
+            client: { id: "local-node", version: "1.0.0", platform: "local", mode: "test" },
+            minProtocol: 1,
+            maxProtocol: 1,
+            role: "node",
+            device: { id: nodeId },
+            auth: tokenAuth(),
+          },
+          8000,
+        );
+        expectOk(helloRes, "connect node simulator");
+        log(`node simulator connected (role=node), nodeId=${nodeId}`);
+
+        // Background loop: pull pending actions and immediately complete invoke.result.
+        const pollIntervalMs = 250;
+        const run = async () => {
+          while (nodeSim.connected && nodeSim.ws && nodeSim.ws.readyState === 1) {
+            try {
+              const pullRes = await rpc(nodeSim, "node.pending.pull", {}, 3000);
+              expectOk(pullRes, "node.pending.pull");
+              const actions = pullRes.payload?.actions ?? [];
+              if (actions.length === 0) {
+                await new Promise((r) => setTimeout(r, pollIntervalMs));
+                continue;
+              }
+              const ids = actions.map((a) => a.id).filter(Boolean);
+              if (ids.length > 0) {
+                // Best-effort ack: keeps pending queue tidy.
+                try {
+                  await rpc(nodeSim, "node.pending.ack", { ids }, 3000);
+                } catch {
+                  // ignore
+                }
+              }
+              // Complete node.invoke.result for each action.
+              for (const action of actions) {
+                const invParams = {
+                  id: action.id,
+                  nodeId: nodeId,
+                  ok: true,
+                  payload: { runId: "dummy-run-" + action.id },
+                };
+                try {
+                  await rpc(nodeSim, "node.invoke.result", invParams, 3000);
+                } catch (e) {
+                  log("node.invoke.result failed for " + action.id + ": " + String(e));
+                }
+              }
+            } catch (e) {
+              log("node simulator loop error: " + String(e));
+              await new Promise((r) => setTimeout(r, 800));
+            }
+          }
+        };
+        run();
+      }
+
+      async function createSessionAndSubscribe() {
+        if (!op.connected) throw new Error("operator not connected");
+        const agentId = $("agentId").value.trim() || "default";
+        const label = $("label").value.trim() || "local";
+        const model = $("model").value.trim() || "unknown";
+        const message = $("initMessage").value.trim();
+
+        const res = await rpc(
+          op,
+          "sessions.create",
+          { agentId, label, model, message },
+          8000,
+        );
+        expectOk(res, "sessions.create");
+        sessionKey = res.payload?.key ?? null;
+        $("sessionKey").textContent = sessionKey ?? "-";
+        log("session created: " + sessionKey);
+
+        // Subscribe to message transcript events.
+        await rpc(op, "sessions.messages.subscribe", { key: sessionKey }, 8000);
+        log("subscribed: sessions.messages for sessionKey=" + sessionKey);
+      }
+
+      async function chatSend() {
+        if (!sessionKey) throw new Error("sessionKey not set");
+        const message = $("chatMessage").value.trim();
+        const res = await rpc(
+          op,
+          "chat.send",
+          { sessionKey, message },
+          8000,
+        );
+        expectOk(res, "chat.send");
+        log("chat.send ok, messageSeq=" + (res.payload?.messageSeq ?? ""));
+      }
+
+      async function quickGetHistory() {
+        if (!sessionKey) throw new Error("sessionKey not set");
+        const res = await rpc(op, "sessions.get", { key: sessionKey, limit: 50 }, 8000);
+        expectOk(res, "sessions.get");
+        log("sessions.get messages=" + JSON.stringify(res.payload?.messages ?? []));
+      }
+
+      async function taskInvoke() {
+        if (!op.connected) throw new Error("operator not connected");
+        const nodeId = $("nodeId").value.trim() || "node-1";
+        const command = $("taskCommand").value.trim() || "test.command";
+        const paramsText = $("taskParams").value.trim();
+        let params = {};
+        if (paramsText) {
+          try {
+            params = JSON.parse(paramsText);
+          } catch (e) {
+            throw new Error("params JSON invalid: " + String(e));
+          }
+        }
+
+        const idempotencyKey = "task-" + Date.now();
+        log(`invoking node.invoke command=${command} id=${idempotencyKey}`);
+        const res = await rpc(
+          op,
+          "node.invoke",
+          {
+            nodeId,
+            command,
+            params,
+            timeoutMs: 5000,
+            idempotencyKey,
+          },
+          12000,
+        );
+        expectOk(res, "node.invoke");
+        $("taskResult").textContent = JSON.stringify(res.payload?.payload ?? {});
+        log("node.invoke ok payload=" + JSON.stringify(res.payload?.payload ?? {}));
+      }
+
+      $("btnConnectOperator").addEventListener("click", async () => {
+        try {
+          await connectOperator();
+        } catch (e) {
+          log("connect operator error: " + String(e));
+          $("opStatus").textContent = "operator: error";
+        }
+      });
+
+      $("btnConnectNode").addEventListener("click", async () => {
+        try {
+          await connectNodeSim();
+        } catch (e) {
+          log("connect node simulator error: " + String(e));
+          $("nodeStatus").textContent = "node: error";
+        }
+      });
+
+      $("btnCreateSession").addEventListener("click", async () => {
+        try {
+          await createSessionAndSubscribe();
+        } catch (e) {
+          log("create session error: " + String(e));
+        }
+      });
+
+      $("btnChatSend").addEventListener("click", async () => {
+        try {
+          await chatSend();
+        } catch (e) {
+          log("chat.send error: " + String(e));
+        }
+      });
+
+      $("btnRefreshHistory").addEventListener("click", async () => {
+        try {
+          await quickGetHistory();
+        } catch (e) {
+          log("sessions.get error: " + String(e));
+        }
+      });
+
+      $("btnTaskInvoke").addEventListener("click", async () => {
+        try {
+          await taskInvoke();
+        } catch (e) {
+          log("node.invoke error: " + String(e));
+        }
+      });
+    </script>
+  </body>
+</html>
+
