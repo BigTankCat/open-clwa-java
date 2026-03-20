@@ -97,7 +97,8 @@ public final class MethodScopes {
           "sessions.abort",
           "browser.request",
           "push.test",
-          "node.pending.enqueue");
+          "node.pending.enqueue",
+          "llm.config.set");
 
   private static final Set<String> ADMIN_METHODS =
       Set.of(

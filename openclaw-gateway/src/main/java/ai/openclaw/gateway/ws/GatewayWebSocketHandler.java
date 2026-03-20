@@ -7,6 +7,8 @@ import ai.openclaw.config.ConfigParsers;
 import ai.openclaw.gateway.auth.MethodScopes;
 import ai.openclaw.config.ConfigMergePatch;
 import ai.openclaw.config.ConfigEnvRestorer;
+import ai.openclaw.gateway.llm.OpenAiCompatibleChatClient;
+import com.fasterxml.jackson.databind.JsonNode;
 import ai.openclaw.protocol.EventFrame;
 import ai.openclaw.gateway.sessions.InMemorySessionStore;
 import ai.openclaw.protocol.ErrorCodes;
@@ -201,6 +203,8 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     LinkedHashSet<String> methods = new LinkedHashSet<>(NODE_BASE_METHODS);
     methods.add("connect");
     methods.add(POLL_METHOD);
+    // Dev-only in-memory LLM config for local integration.
+    methods.add("llm.config.set");
     FEATURE_METHODS = List.copyOf(methods);
     FEATURE_METHODS_SET = Set.copyOf(methods);
 
@@ -223,6 +227,36 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
 
   private final ConfigLoader configLoader;
   private final String gatewayToken;
+
+  private static final ExecutorService LLM_EXECUTOR =
+      Executors.newCachedThreadPool(
+          new ThreadFactory() {
+            @Override
+            public Thread newThread(Runnable r) {
+              Thread t = new Thread(r);
+              t.setDaemon(true);
+              t.setName("openclaw-llm-executor");
+              return t;
+            }
+          });
+
+  private static final class LlmConfig {
+    final String chatCompletionsUrl;
+    final String apiKey;
+    final String model;
+    final Double temperature;
+    final Integer maxTokens;
+
+    LlmConfig(String chatCompletionsUrl, String apiKey, String model, Double temperature, Integer maxTokens) {
+      this.chatCompletionsUrl = chatCompletionsUrl;
+      this.apiKey = apiKey;
+      this.model = model;
+      this.temperature = temperature;
+      this.maxTokens = maxTokens;
+    }
+  }
+
+  private static volatile LlmConfig currentLlmConfig;
 
   private interface WsMethodHandler {
     void handle(WebSocketSession session, RequestFrame req, Map<String, Object> params);
@@ -346,52 +380,53 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     this.configWriter = configWriter;
     this.sessionStore = sessionStore;
     this.gatewayToken = env.getProperty("OPENCLAW_GATEWAY_TOKEN", "");
-    this.methodHandlers =
-        Map.of(
-            "health",
-            (session, req, params) -> handleHealth(session, req, params),
-            "poll",
-            (session, req, params) -> handlePoll(session, req, params),
-            "config.get",
-            (session, req, params) -> handleConfigGet(session, req, params),
-            "config.apply",
-            (session, req, params) -> handleConfigApply(session, req, params),
-            "config.patch",
-            (session, req, params) -> handleConfigPatch(session, req, params),
-            "node.invoke",
-            (session, req, params) -> handleNodeInvoke(session, req, params),
-            "node.invoke.result",
-            (session, req, params) -> handleNodeInvokeResult(session, req, params),
-            "node.event",
-            (session, req, params) -> handleNodeEvent(session, req, params),
-            "node.pending.drain",
-            (session, req, params) -> handleNodePendingDrain(session, req, params),
-            "node.pending.pull",
-            (session, req, params) -> handleNodePendingPull(session, req, params),
-            "node.pending.ack",
-            (session, req, params) -> handleNodePendingAck(session, req, params),
-            "node.pending.enqueue",
-            (session, req, params) -> handleNodePendingEnqueue(session, req, params),
-            "sessions.create",
-            (session, req, params) -> handleSessionsCreate(session, req, params),
-            "sessions.list",
-            (session, req, params) -> handleSessionsList(session, req, params),
-            "sessions.get",
-            (session, req, params) -> handleSessionsGet(session, req, params),
-            "sessions.delete",
-            (session, req, params) -> handleSessionsDelete(session, req, params),
-            "sessions.subscribe",
-            (session, req, params) -> handleSessionsSubscribe(session, req, params),
-            "sessions.unsubscribe",
-            (session, req, params) -> handleSessionsUnsubscribe(session, req, params),
-            "sessions.messages.subscribe",
-            (session, req, params) -> handleSessionsMessagesSubscribe(session, req, params),
-            "sessions.messages.unsubscribe",
-            (session, req, params) -> handleSessionsMessagesUnsubscribe(session, req, params),
-            "chat.send",
-            (session, req, params) -> handleChatSend(session, req, params),
-            "status",
-            (session, req, params) -> handleStatus(session, req));
+    Map<String, WsMethodHandler> handlers = new LinkedHashMap<>();
+    handlers.put("health", (session, req, params) -> handleHealth(session, req, params));
+    handlers.put("poll", (session, req, params) -> handlePoll(session, req, params));
+    handlers.put("config.get", (session, req, params) -> handleConfigGet(session, req, params));
+    handlers.put("config.apply", (session, req, params) -> handleConfigApply(session, req, params));
+    handlers.put("config.patch", (session, req, params) -> handleConfigPatch(session, req, params));
+    handlers.put("node.invoke", (session, req, params) -> handleNodeInvoke(session, req, params));
+    handlers.put(
+        "node.invoke.result",
+        (session, req, params) -> handleNodeInvokeResult(session, req, params));
+    handlers.put("node.event", (session, req, params) -> handleNodeEvent(session, req, params));
+    handlers.put(
+        "node.pending.drain",
+        (session, req, params) -> handleNodePendingDrain(session, req, params));
+    handlers.put(
+        "node.pending.pull",
+        (session, req, params) -> handleNodePendingPull(session, req, params));
+    handlers.put(
+        "node.pending.ack",
+        (session, req, params) -> handleNodePendingAck(session, req, params));
+    handlers.put(
+        "node.pending.enqueue",
+        (session, req, params) -> handleNodePendingEnqueue(session, req, params));
+    handlers.put(
+        "sessions.create",
+        (session, req, params) -> handleSessionsCreate(session, req, params));
+    handlers.put("sessions.list", (session, req, params) -> handleSessionsList(session, req, params));
+    handlers.put("sessions.get", (session, req, params) -> handleSessionsGet(session, req, params));
+    handlers.put(
+        "sessions.delete",
+        (session, req, params) -> handleSessionsDelete(session, req, params));
+    handlers.put(
+        "sessions.subscribe",
+        (session, req, params) -> handleSessionsSubscribe(session, req, params));
+    handlers.put(
+        "sessions.unsubscribe",
+        (session, req, params) -> handleSessionsUnsubscribe(session, req, params));
+    handlers.put(
+        "sessions.messages.subscribe",
+        (session, req, params) -> handleSessionsMessagesSubscribe(session, req, params));
+    handlers.put(
+        "sessions.messages.unsubscribe",
+        (session, req, params) -> handleSessionsMessagesUnsubscribe(session, req, params));
+    handlers.put("chat.send", (session, req, params) -> handleChatSend(session, req, params));
+    handlers.put("llm.config.set", (session, req, params) -> handleLlmConfigSet(session, req, params));
+    handlers.put("status", (session, req, params) -> handleStatus(session, req));
+    this.methodHandlers = handlers;
   }
 
   @Override
@@ -750,6 +785,133 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     sendResponse(session, req.getId(), true, payload, null);
   }
 
+  private void handleLlmConfigSet(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    Object baseUrlObj = params != null ? params.get("baseUrl") : null;
+    Object chatCompletionsUrlObj = params != null ? params.get("chatCompletionsUrl") : null;
+    Object apiKeyObj = params != null ? params.get("apiKey") : null;
+    Object modelObj = params != null ? params.get("model") : null;
+    Object temperatureObj = params != null ? params.get("temperature") : null;
+    Object maxTokensObj = params != null ? params.get("maxTokens") : null;
+
+    String baseUrl = baseUrlObj instanceof String s ? s.trim() : null;
+    String chatCompletionsUrl =
+        chatCompletionsUrlObj instanceof String s ? s.trim() : null;
+    String apiKey = apiKeyObj instanceof String s ? s.trim() : null;
+    String model = modelObj instanceof String s ? s.trim() : null;
+
+    if ((chatCompletionsUrl == null || chatCompletionsUrl.isBlank()) && (baseUrl == null || baseUrl.isBlank())) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "llm.config.set: baseUrl or chatCompletionsUrl required"));
+      return;
+    }
+    if (apiKey == null || apiKey.isBlank()) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "llm.config.set: apiKey required"));
+      return;
+    }
+    if (model == null || model.isBlank()) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "llm.config.set: model required"));
+      return;
+    }
+
+    if (chatCompletionsUrl == null || chatCompletionsUrl.isBlank()) {
+      chatCompletionsUrl = buildChatCompletionsUrlFromBaseUrl(baseUrl);
+    }
+
+    Double temperature = null;
+    if (temperatureObj instanceof Number n) {
+      temperature = n.doubleValue();
+    }
+    Integer maxTokens = null;
+    if (maxTokensObj instanceof Number n) {
+      int v = n.intValue();
+      if (v > 0) maxTokens = v;
+    }
+
+    currentLlmConfig =
+        new LlmConfig(chatCompletionsUrl, apiKey, model, temperature, maxTokens);
+
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("ok", true);
+    payload.put("chatCompletionsUrl", chatCompletionsUrl);
+    payload.put("model", model);
+    payload.put("temperature", temperature);
+    payload.put("maxTokens", maxTokens);
+    sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  private String buildChatCompletionsUrlFromBaseUrl(String baseUrl) {
+    String b = baseUrl.trim();
+    if (b.endsWith("/chat/completions")) {
+      return b;
+    }
+    if (b.contains("/chat/completions")) {
+      return b;
+    }
+    if (b.endsWith("/v1")) {
+      return b + "/chat/completions";
+    }
+    if (b.endsWith("/")) {
+      return b + "v1/chat/completions";
+    }
+    return b + "/v1/chat/completions";
+  }
+
+  private LlmConfig resolveLlmConfigOrNull() {
+    LlmConfig cfg = currentLlmConfig;
+    if (cfg != null && cfg.chatCompletionsUrl != null && !cfg.chatCompletionsUrl.isBlank()) {
+      return cfg;
+    }
+
+    String chatCompletionsUrl = System.getenv().getOrDefault("OPENCLAW_LLM_CHAT_COMPLETIONS_URL", "").trim();
+    String baseUrl = System.getenv().getOrDefault("OPENCLAW_LLM_BASE_URL", "").trim();
+    String apiKey = System.getenv().getOrDefault("OPENCLAW_LLM_API_KEY", "").trim();
+    String model = System.getenv().getOrDefault("OPENCLAW_LLM_MODEL", "").trim();
+
+    if ((chatCompletionsUrl == null || chatCompletionsUrl.isBlank()) && (baseUrl != null && !baseUrl.isBlank())) {
+      chatCompletionsUrl = buildChatCompletionsUrlFromBaseUrl(baseUrl);
+    }
+    if (apiKey == null || apiKey.isBlank()) return null;
+    if (model == null || model.isBlank()) return null;
+    if (chatCompletionsUrl == null || chatCompletionsUrl.isBlank()) return null;
+
+    Double temperature = null;
+    String tRaw = System.getenv().getOrDefault("OPENCLAW_LLM_TEMPERATURE", "").trim();
+    if (!tRaw.isBlank()) {
+      try {
+        temperature = Double.parseDouble(tRaw);
+      } catch (Exception ignored) {
+        temperature = null;
+      }
+    }
+
+    Integer maxTokens = null;
+    String mtRaw = System.getenv().getOrDefault("OPENCLAW_LLM_MAX_TOKENS", "").trim();
+    if (!mtRaw.isBlank()) {
+      try {
+        maxTokens = Integer.parseInt(mtRaw);
+      } catch (Exception ignored) {
+        maxTokens = null;
+      }
+    }
+
+    return new LlmConfig(chatCompletionsUrl, apiKey, model, temperature, maxTokens);
+  }
+
   private void handleSessionsCreate(
       WebSocketSession session, RequestFrame req, Map<String, Object> params) {
     String agentId = optionalNonEmptyString(params, "agentId");
@@ -930,6 +1092,118 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     tracePayload.put("message", message);
     tracePayload.put("ts", System.currentTimeMillis());
     sessionStore.addEvent(sessionKey, "chat.send", tracePayload);
+
+    // Background: call LLM and append assistant message + detailed trace.
+    // This keeps the WS request fast (Node emits assistant output asynchronously).
+    final String taskSessionKey = sessionKey;
+    final String lastUserMessage = message;
+    LLM_EXECUTOR.submit(
+        () -> {
+          try {
+            handleLlmForChatSend(taskSessionKey, lastUserMessage);
+          } catch (Exception e) {
+            handleLlmError(taskSessionKey, e);
+          }
+        });
+  }
+
+  private void handleLlmError(String sessionKey, Exception e) {
+    InMemorySessionStore.SessionEntry entry = sessionStore.get(sessionKey);
+    if (entry == null) return;
+    String assistantText = "LLM error: " + String.valueOf(e.getMessage());
+
+    int before = entry.messages.size();
+    sessionStore.addMessage(sessionKey, assistantText);
+    int after = entry.messages.size();
+    int assistantSeq = after > before ? before + 1 : after;
+
+    emitSessionsChanged(sessionKey, "llm.error");
+    emitSessionsMessage(sessionKey, assistantSeq, assistantText);
+
+    Map<String, Object> errPayload = new LinkedHashMap<>();
+    errPayload.put("ts", System.currentTimeMillis());
+    errPayload.put("message", e.getMessage());
+    sessionStore.addEvent(sessionKey, "llm.error", errPayload);
+  }
+
+  private void handleLlmForChatSend(String sessionKey, String lastUserMessage) throws Exception {
+    InMemorySessionStore.SessionEntry entry = sessionStore.get(sessionKey);
+    if (entry == null) return;
+
+    LlmConfig cfg = resolveLlmConfigOrNull();
+    if (cfg == null) {
+      handleLlmError(sessionKey, new IllegalStateException("missing LLM config (llm.config.set or OPENCLAW_LLM_* env vars)"));
+      return;
+    }
+
+    // Build OpenAI-compatible messages from the session transcript strings.
+    // Naive role alternation: user (even index), assistant (odd index).
+    List<String> history = sessionStore.listMessages(sessionKey, 50);
+    java.util.List<OpenAiCompatibleChatClient.ChatMessage> llmMessages = new ArrayList<>();
+    java.util.List<Map<String, Object>> llmMessagesPayload = new ArrayList<>();
+    for (int i = 0; i < history.size(); i++) {
+      String content = history.get(i);
+      String role = (i % 2 == 0) ? "user" : "assistant";
+      llmMessages.add(new OpenAiCompatibleChatClient.ChatMessage(role, content));
+      Map<String, Object> m = new LinkedHashMap<>();
+      m.put("role", role);
+      m.put("content", content);
+      llmMessagesPayload.add(m);
+    }
+
+    Map<String, Object> reqTrace = new LinkedHashMap<>();
+    reqTrace.put("ts", System.currentTimeMillis());
+    reqTrace.put("model", cfg.model);
+    reqTrace.put("chatCompletionsUrl", cfg.chatCompletionsUrl);
+    reqTrace.put("temperature", cfg.temperature);
+    reqTrace.put("maxTokens", cfg.maxTokens);
+    reqTrace.put("messages", llmMessagesPayload);
+    sessionStore.addEvent(sessionKey, "llm.request", reqTrace);
+
+    OpenAiCompatibleChatClient client = new OpenAiCompatibleChatClient();
+    OpenAiCompatibleChatClient.ChatResult result =
+        client.chatCompletions(
+            cfg.chatCompletionsUrl,
+            cfg.apiKey,
+            cfg.model,
+            llmMessages,
+            cfg.temperature,
+            cfg.maxTokens);
+
+    JsonNode raw = result.raw();
+    JsonNode usage = result.usage();
+    JsonNode toolCalls = result.toolCalls();
+
+    Map<String, Object> respTrace = new LinkedHashMap<>();
+    respTrace.put("ts", System.currentTimeMillis());
+    respTrace.put("raw", raw);
+    sessionStore.addEvent(sessionKey, "llm.response", respTrace);
+
+    if (usage != null && !usage.isNull()) {
+      sessionStore.addEvent(sessionKey, "llm.usage", usage);
+    }
+    if (toolCalls != null && !toolCalls.isNull()) {
+      sessionStore.addEvent(sessionKey, "llm.tool_calls", toolCalls);
+    }
+
+    String assistantText = result.content();
+    if (assistantText == null) assistantText = "";
+    assistantText = assistantText.trim();
+    if (assistantText.isBlank()) {
+      if (toolCalls != null && !toolCalls.isNull()) {
+        assistantText = "Tool calls: " + toolCalls.toString();
+      } else {
+        assistantText = "NO_REPLY";
+      }
+    }
+
+    int before = entry.messages.size();
+    sessionStore.addMessage(sessionKey, assistantText);
+    int after = entry.messages.size();
+    int assistantSeq = after > before ? before + 1 : after;
+
+    emitSessionsChanged(sessionKey, "llm");
+    emitSessionsMessage(sessionKey, assistantSeq, assistantText);
   }
 
   private void handlePoll(WebSocketSession session, RequestFrame req, Map<String, Object> params) {

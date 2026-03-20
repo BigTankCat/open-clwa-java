@@ -194,6 +194,43 @@
     </div>
 
     <div class="card">
+      <h3>LLM 配置 (llm.config.set)</h3>
+      <div class="muted">配置厂商地址与 API key。网关将把 chat.send 直接转发到大模型，并把 prompt/response/tool_calls/usage 写入 trace。</div>
+      <div class="row">
+        <label style="flex: 1">
+          chatCompletionsUrl（推荐填全路径，可选）：
+          <input id="llmChatCompletionsUrl" value="" style="width: 100%" />
+        </label>
+      </div>
+      <div class="row">
+        <label style="flex: 1">
+          baseUrl（当上面为空时用于拼接）：比如 https://api.openai.com
+          <input id="llmBaseUrl" value="https://api.openai.com" style="width: 100%" />
+        </label>
+      </div>
+      <div class="row">
+        <label style="flex: 1">
+          apiKey：
+          <input id="llmApiKey" placeholder="OPENCLAW_LLM_API_KEY" style="width: 100%" />
+        </label>
+      </div>
+      <div class="row">
+        <label>
+          model：
+          <input id="llmModel" value="gpt-4o-mini" />
+        </label>
+        <label>
+          temperature：
+          <input id="llmTemperature" value="0.2" />
+        </label>
+      </div>
+      <div class="row">
+        <button class="primary" id="btnSaveLlmConfig">Save LLM config</button>
+        <span class="muted" id="llmStatus">-</span>
+      </div>
+    </div>
+
+    <div class="card">
       <h3>Log</h3>
       <pre class="log" id="log"></pre>
     </div>
@@ -502,6 +539,34 @@
         await refreshTrace().catch((e) => log("refreshTrace error: " + String(e)));
       }
 
+      async function saveLlmConfig() {
+        if (!op.connected) throw new Error("operator not connected");
+        const chatCompletionsUrl = $("llmChatCompletionsUrl").value.trim();
+        const baseUrl = $("llmBaseUrl").value.trim();
+        const apiKey = $("llmApiKey").value.trim();
+        const model = $("llmModel").value.trim();
+        const temperatureRaw = $("llmTemperature").value.trim();
+        let temperature = null;
+        if (temperatureRaw) {
+          const t = Number(temperatureRaw);
+          temperature = Number.isFinite(t) ? t : null;
+        }
+
+        const params = {
+          baseUrl: chatCompletionsUrl ? undefined : baseUrl,
+          chatCompletionsUrl: chatCompletionsUrl || undefined,
+          apiKey,
+          model,
+          ...(temperature != null ? { temperature } : {}),
+        };
+
+        const res = await rpc(op, "llm.config.set", params, 8000);
+        expectOk(res, "llm.config.set");
+        $("llmStatus").textContent = "ok";
+        log("llm.config.set ok");
+        await refreshTrace().catch((e) => log("refreshTrace error: " + String(e)));
+      }
+
       $("btnConnectOperator").addEventListener("click", async () => {
         try {
           await connectOperator();
@@ -549,6 +614,15 @@
           await taskInvoke();
         } catch (e) {
           log("node.invoke error: " + String(e));
+        }
+      });
+
+      $("btnSaveLlmConfig").addEventListener("click", async () => {
+        try {
+          await saveLlmConfig();
+        } catch (e) {
+          $("llmStatus").textContent = "error";
+          log("save llm config error: " + String(e));
         }
       });
 
