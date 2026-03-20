@@ -495,6 +495,8 @@
         );
         expectOk(res, "chat.send");
         log("chat.send ok, messageSeq=" + (res.payload?.messageSeq ?? ""));
+        // LLM completion is async; still refresh quickly so trace shows llm.request.
+        await refreshTrace().catch((e) => log("refreshTrace error: " + String(e)));
       }
 
       async function quickGetHistory() {
