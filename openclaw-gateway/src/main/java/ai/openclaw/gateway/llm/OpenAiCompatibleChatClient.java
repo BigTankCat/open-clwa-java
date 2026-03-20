@@ -39,7 +39,9 @@ public final class OpenAiCompatibleChatClient {
       String model,
       List<ChatMessage> messages,
       Double temperature,
-      Integer maxTokens)
+      Integer maxTokens,
+      Object tools,
+      Object toolChoice)
       throws Exception {
     if (chatCompletionsUrl == null || chatCompletionsUrl.isBlank()) {
       throw new IllegalArgumentException("chatCompletionsUrl required");
@@ -66,6 +68,12 @@ public final class OpenAiCompatibleChatClient {
                 false));
     if (maxTokens != null) {
       body.put("max_tokens", maxTokens);
+    }
+    if (tools != null) {
+      body.put("tools", tools);
+    }
+    if (toolChoice != null) {
+      body.put("tool_choice", toolChoice);
     }
 
     String json = MAPPER.writeValueAsString(body);

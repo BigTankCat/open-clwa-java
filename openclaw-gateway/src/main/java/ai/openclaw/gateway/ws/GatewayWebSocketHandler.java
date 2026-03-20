@@ -246,17 +246,34 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     final String model;
     final Double temperature;
     final Integer maxTokens;
+    final String systemPrompt;
+    final Object tools;
+    final Object toolChoice;
 
-    LlmConfig(String chatCompletionsUrl, String apiKey, String model, Double temperature, Integer maxTokens) {
+    LlmConfig(
+        String chatCompletionsUrl,
+        String apiKey,
+        String model,
+        Double temperature,
+        Integer maxTokens,
+        String systemPrompt,
+        Object tools,
+        Object toolChoice) {
       this.chatCompletionsUrl = chatCompletionsUrl;
       this.apiKey = apiKey;
       this.model = model;
       this.temperature = temperature;
       this.maxTokens = maxTokens;
+      this.systemPrompt = systemPrompt;
+      this.tools = tools;
+      this.toolChoice = toolChoice;
     }
   }
 
   private static volatile LlmConfig currentLlmConfig;
+
+  private static final ConcurrentHashMap<String, Object> LLM_SESSION_LOCKS =
+      new ConcurrentHashMap<>();
 
   private interface WsMethodHandler {
     void handle(WebSocketSession session, RequestFrame req, Map<String, Object> params);
@@ -793,12 +810,17 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     Object modelObj = params != null ? params.get("model") : null;
     Object temperatureObj = params != null ? params.get("temperature") : null;
     Object maxTokensObj = params != null ? params.get("maxTokens") : null;
+    Object systemPromptObj = params != null ? params.get("systemPrompt") : null;
+    Object toolsObj = params != null ? params.get("tools") : null;
+    Object toolChoiceObj = params != null ? params.get("toolChoice") : null;
 
     String baseUrl = baseUrlObj instanceof String s ? s.trim() : null;
     String chatCompletionsUrl =
         chatCompletionsUrlObj instanceof String s ? s.trim() : null;
     String apiKey = apiKeyObj instanceof String s ? s.trim() : null;
     String model = modelObj instanceof String s ? s.trim() : null;
+    String systemPrompt =
+        systemPromptObj instanceof String s ? s.trim() : null;
 
     if ((chatCompletionsUrl == null || chatCompletionsUrl.isBlank()) && (baseUrl == null || baseUrl.isBlank())) {
       sendResponse(
@@ -843,7 +865,15 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     }
 
     currentLlmConfig =
-        new LlmConfig(chatCompletionsUrl, apiKey, model, temperature, maxTokens);
+        new LlmConfig(
+            chatCompletionsUrl,
+            apiKey,
+            model,
+            temperature,
+            maxTokens,
+            systemPrompt,
+            toolsObj,
+            toolChoiceObj);
 
     Map<String, Object> payload = new LinkedHashMap<>();
     payload.put("ok", true);
@@ -851,6 +881,9 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     payload.put("model", model);
     payload.put("temperature", temperature);
     payload.put("maxTokens", maxTokens);
+    if (systemPrompt != null && !systemPrompt.isBlank()) {
+      payload.put("systemPrompt", systemPrompt);
+    }
     sendResponse(session, req.getId(), true, payload, null);
   }
 
@@ -909,7 +942,15 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       }
     }
 
-    return new LlmConfig(chatCompletionsUrl, apiKey, model, temperature, maxTokens);
+    return new LlmConfig(
+        chatCompletionsUrl,
+        apiKey,
+        model,
+        temperature,
+        maxTokens,
+        null,
+        null,
+        null);
   }
 
   private void handleSessionsCreate(
@@ -1129,81 +1170,103 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
   private void handleLlmForChatSend(String sessionKey, String lastUserMessage) throws Exception {
     InMemorySessionStore.SessionEntry entry = sessionStore.get(sessionKey);
     if (entry == null) return;
-
-    LlmConfig cfg = resolveLlmConfigOrNull();
-    if (cfg == null) {
-      handleLlmError(sessionKey, new IllegalStateException("missing LLM config (llm.config.set or OPENCLAW_LLM_* env vars)"));
-      return;
-    }
-
-    // Build OpenAI-compatible messages from the session transcript strings.
-    // Naive role alternation: user (even index), assistant (odd index).
-    List<String> history = sessionStore.listMessages(sessionKey, 50);
-    java.util.List<OpenAiCompatibleChatClient.ChatMessage> llmMessages = new ArrayList<>();
-    java.util.List<Map<String, Object>> llmMessagesPayload = new ArrayList<>();
-    for (int i = 0; i < history.size(); i++) {
-      String content = history.get(i);
-      String role = (i % 2 == 0) ? "user" : "assistant";
-      llmMessages.add(new OpenAiCompatibleChatClient.ChatMessage(role, content));
-      Map<String, Object> m = new LinkedHashMap<>();
-      m.put("role", role);
-      m.put("content", content);
-      llmMessagesPayload.add(m);
-    }
-
-    Map<String, Object> reqTrace = new LinkedHashMap<>();
-    reqTrace.put("ts", System.currentTimeMillis());
-    reqTrace.put("model", cfg.model);
-    reqTrace.put("chatCompletionsUrl", cfg.chatCompletionsUrl);
-    reqTrace.put("temperature", cfg.temperature);
-    reqTrace.put("maxTokens", cfg.maxTokens);
-    reqTrace.put("messages", llmMessagesPayload);
-    sessionStore.addEvent(sessionKey, "llm.request", reqTrace);
-
-    OpenAiCompatibleChatClient client = new OpenAiCompatibleChatClient();
-    OpenAiCompatibleChatClient.ChatResult result =
-        client.chatCompletions(
-            cfg.chatCompletionsUrl,
-            cfg.apiKey,
-            cfg.model,
-            llmMessages,
-            cfg.temperature,
-            cfg.maxTokens);
-
-    JsonNode raw = result.raw();
-    JsonNode usage = result.usage();
-    JsonNode toolCalls = result.toolCalls();
-
-    Map<String, Object> respTrace = new LinkedHashMap<>();
-    respTrace.put("ts", System.currentTimeMillis());
-    respTrace.put("raw", raw);
-    sessionStore.addEvent(sessionKey, "llm.response", respTrace);
-
-    if (usage != null && !usage.isNull()) {
-      sessionStore.addEvent(sessionKey, "llm.usage", usage);
-    }
-    if (toolCalls != null && !toolCalls.isNull()) {
-      sessionStore.addEvent(sessionKey, "llm.tool_calls", toolCalls);
-    }
-
-    String assistantText = result.content();
-    if (assistantText == null) assistantText = "";
-    assistantText = assistantText.trim();
-    if (assistantText.isBlank()) {
-      if (toolCalls != null && !toolCalls.isNull()) {
-        assistantText = "Tool calls: " + toolCalls.toString();
-      } else {
-        assistantText = "NO_REPLY";
+    Object lock = LLM_SESSION_LOCKS.computeIfAbsent(sessionKey, (k) -> new Object());
+    synchronized (lock) {
+      LlmConfig cfg = resolveLlmConfigOrNull();
+      if (cfg == null) {
+        handleLlmError(
+            sessionKey,
+            new IllegalStateException(
+                "missing LLM config (llm.config.set or OPENCLAW_LLM_* env vars)"));
+        return;
       }
+
+      // Build OpenAI-compatible messages from the session transcript strings.
+      // Naive role alternation: user (even index), assistant (odd index).
+      List<String> history = sessionStore.listMessages(sessionKey, 50);
+      java.util.List<OpenAiCompatibleChatClient.ChatMessage> llmMessages =
+          new ArrayList<>();
+      java.util.List<Map<String, Object>> llmMessagesPayload = new ArrayList<>();
+
+      if (cfg.systemPrompt != null && !cfg.systemPrompt.isBlank()) {
+        llmMessages.add(new OpenAiCompatibleChatClient.ChatMessage("system", cfg.systemPrompt));
+        Map<String, Object> sys = new LinkedHashMap<>();
+        sys.put("role", "system");
+        sys.put("content", cfg.systemPrompt);
+        llmMessagesPayload.add(sys);
+      }
+
+      for (int i = 0; i < history.size(); i++) {
+        String content = history.get(i);
+        String role = (i % 2 == 0) ? "user" : "assistant";
+        llmMessages.add(new OpenAiCompatibleChatClient.ChatMessage(role, content));
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("role", role);
+        m.put("content", content);
+        llmMessagesPayload.add(m);
+      }
+
+      Map<String, Object> reqTrace = new LinkedHashMap<>();
+      reqTrace.put("ts", System.currentTimeMillis());
+      reqTrace.put("model", cfg.model);
+      reqTrace.put("chatCompletionsUrl", cfg.chatCompletionsUrl);
+      reqTrace.put("temperature", cfg.temperature);
+      reqTrace.put("maxTokens", cfg.maxTokens);
+      if (cfg.systemPrompt != null && !cfg.systemPrompt.isBlank()) {
+        reqTrace.put("systemPrompt", cfg.systemPrompt);
+      }
+      reqTrace.put("tools", cfg.tools);
+      reqTrace.put("toolChoice", cfg.toolChoice);
+      reqTrace.put("messages", llmMessagesPayload);
+      sessionStore.addEvent(sessionKey, "llm.request", reqTrace);
+
+      OpenAiCompatibleChatClient client = new OpenAiCompatibleChatClient();
+      OpenAiCompatibleChatClient.ChatResult result =
+          client.chatCompletions(
+              cfg.chatCompletionsUrl,
+              cfg.apiKey,
+              cfg.model,
+              llmMessages,
+              cfg.temperature,
+              cfg.maxTokens,
+              cfg.tools,
+              cfg.toolChoice);
+
+      JsonNode raw = result.raw();
+      JsonNode usage = result.usage();
+      JsonNode toolCalls = result.toolCalls();
+
+      Map<String, Object> respTrace = new LinkedHashMap<>();
+      respTrace.put("ts", System.currentTimeMillis());
+      respTrace.put("raw", raw);
+      sessionStore.addEvent(sessionKey, "llm.response", respTrace);
+
+      if (usage != null && !usage.isNull()) {
+        sessionStore.addEvent(sessionKey, "llm.usage", usage);
+      }
+      if (toolCalls != null && !toolCalls.isNull()) {
+        sessionStore.addEvent(sessionKey, "llm.tool_calls", toolCalls);
+      }
+
+      String assistantText = result.content();
+      if (assistantText == null) assistantText = "";
+      assistantText = assistantText.trim();
+      if (assistantText.isBlank()) {
+        if (toolCalls != null && !toolCalls.isNull()) {
+          assistantText = "Tool calls: " + toolCalls.toString();
+        } else {
+          assistantText = "NO_REPLY";
+        }
+      }
+
+      int before = entry.messages.size();
+      sessionStore.addMessage(sessionKey, assistantText);
+      int after = entry.messages.size();
+      int assistantSeq = after > before ? before + 1 : after;
+
+      emitSessionsChanged(sessionKey, "llm");
+      emitSessionsMessage(sessionKey, assistantSeq, assistantText);
     }
-
-    int before = entry.messages.size();
-    sessionStore.addMessage(sessionKey, assistantText);
-    int after = entry.messages.size();
-    int assistantSeq = after > before ? before + 1 : after;
-
-    emitSessionsChanged(sessionKey, "llm");
-    emitSessionsMessage(sessionKey, assistantSeq, assistantText);
   }
 
   private void handlePoll(WebSocketSession session, RequestFrame req, Map<String, Object> params) {

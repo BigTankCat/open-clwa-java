@@ -225,6 +225,25 @@
         </label>
       </div>
       <div class="row">
+        <label style="flex: 1">
+          systemPrompt（可选；OpenAI 模式 system 消息）：
+          <textarea id="llmSystemPrompt" style="width: 100%; min-height: 70px;"></textarea>
+        </label>
+      </div>
+      <div class="row">
+        <label style="flex: 1">
+          tools（可选；OpenAI JSON，通常是数组）：例如
+          <code>[{"type":"function","function":{"name":"x","description":"y","parameters":{}}}]</code>
+          <textarea id="llmToolsJson" style="width: 100%; min-height: 70px;">[]</textarea>
+        </label>
+      </div>
+      <div class="row">
+        <label style="flex: 1">
+          toolChoice（可选；"auto" 或 OpenAI 对象）：例如 "auto" 或 {"type":"function","function":{"name":"x"}}
+          <input id="llmToolChoice" value="auto" style="width: 100%" />
+        </label>
+      </div>
+      <div class="row">
         <button class="primary" id="btnSaveLlmConfig">Save LLM config</button>
         <span class="muted" id="llmStatus">-</span>
       </div>
@@ -548,10 +567,39 @@
         const apiKey = $("llmApiKey").value.trim();
         const model = $("llmModel").value.trim();
         const temperatureRaw = $("llmTemperature").value.trim();
+        const systemPrompt = $("llmSystemPrompt").value.trim();
+        const toolsText = $("llmToolsJson").value.trim();
+        const toolChoiceText = $("llmToolChoice").value.trim();
         let temperature = null;
         if (temperatureRaw) {
           const t = Number(temperatureRaw);
           temperature = Number.isFinite(t) ? t : null;
+        }
+
+        let tools = null;
+        if (toolsText && toolsText !== "[]") {
+          try {
+            tools = JSON.parse(toolsText);
+          } catch (e) {
+            throw new Error("tools JSON invalid: " + String(e));
+          }
+        } else if (toolsText === "[]") {
+          tools = [];
+        }
+
+        let toolChoice = null;
+        if (toolChoiceText) {
+          // allow both "auto" and JSON objects
+          if (toolChoiceText === "auto" || toolChoiceText === "none") {
+            toolChoice = toolChoiceText;
+          } else {
+            try {
+              toolChoice = JSON.parse(toolChoiceText);
+            } catch (e) {
+              // fall back to raw string
+              toolChoice = toolChoiceText;
+            }
+          }
         }
 
         const params = {
@@ -559,7 +607,10 @@
           chatCompletionsUrl: chatCompletionsUrl || undefined,
           apiKey,
           model,
+          ...(systemPrompt ? { systemPrompt } : {}),
           ...(temperature != null ? { temperature } : {}),
+          ...(tools != null ? { tools } : {}),
+          ...(toolChoice != null ? { toolChoice } : {}),
         };
 
         const res = await rpc(op, "llm.config.set", params, 8000);
