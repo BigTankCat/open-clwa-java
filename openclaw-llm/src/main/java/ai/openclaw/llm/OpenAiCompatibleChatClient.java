@@ -1,4 +1,4 @@
-package ai.openclaw.gateway.llm;
+package ai.openclaw.llm;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -14,10 +14,13 @@ import java.util.Map;
 /**
  * Minimal OpenAI-compatible Chat Completions client.
  *
- * Expected response shape:
- * - choices[0].message.content
- * - choices[0].message.tool_calls (optional)
- * - usage (optional)
+ * <p>Expected response shape:
+ *
+ * <ul>
+ *   <li>choices[0].message.content
+ *   <li>choices[0].message.tool_calls (optional)
+ *   <li>usage (optional)
+ * </ul>
  */
 public final class OpenAiCompatibleChatClient {
   private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -96,7 +99,10 @@ public final class OpenAiCompatibleChatClient {
 
     JsonNode raw = MAPPER.readTree(resp.body());
     JsonNode firstChoice = raw.path("choices");
-    JsonNode message = firstChoice.isArray() && firstChoice.size() > 0 ? firstChoice.get(0).path("message") : null;
+    JsonNode message =
+        firstChoice.isArray() && firstChoice.size() > 0
+            ? firstChoice.get(0).path("message")
+            : null;
     String content = message != null ? message.path("content").asText("") : "";
     JsonNode toolCalls = message != null ? message.get("tool_calls") : null;
     JsonNode usage = raw.get("usage");
@@ -104,4 +110,3 @@ public final class OpenAiCompatibleChatClient {
     return new ChatResult(content, toolCalls, usage, raw);
   }
 }
-

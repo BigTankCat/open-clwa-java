@@ -7,7 +7,11 @@ import ai.openclaw.config.ConfigParsers;
 import ai.openclaw.gateway.auth.MethodScopes;
 import ai.openclaw.config.ConfigMergePatch;
 import ai.openclaw.config.ConfigEnvRestorer;
-import ai.openclaw.gateway.llm.OpenAiCompatibleChatClient;
+import ai.openclaw.agent.tools.OpenClawToolRegistry;
+import ai.openclaw.gateway.plugins.OpenClawPluginLoader;
+import ai.openclaw.llm.OpenAiCompatibleChatClient;
+import ai.openclaw.memory.MemoryHit;
+import ai.openclaw.memory.SqliteMemoryStore;
 import com.fasterxml.jackson.databind.JsonNode;
 import ai.openclaw.protocol.EventFrame;
 import ai.openclaw.gateway.sessions.InMemorySessionStore;
@@ -205,6 +209,10 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     methods.add(POLL_METHOD);
     // Dev-only in-memory LLM config for local integration.
     methods.add("llm.config.set");
+    methods.add("memory.put");
+    methods.add("memory.search");
+    methods.add("plugins.list");
+    methods.add("agent.tools.list");
     FEATURE_METHODS = List.copyOf(methods);
     FEATURE_METHODS_SET = Set.copyOf(methods);
 
@@ -387,15 +395,24 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
   private final Map<String, WsMethodHandler> methodHandlers;
   private final ConfigWriter configWriter;
   private final InMemorySessionStore sessionStore;
+  private final SqliteMemoryStore sqlMemory;
+  private final OpenClawToolRegistry toolRegistry;
+  private final OpenClawPluginLoader pluginLoader;
 
   public GatewayWebSocketHandler(
       ConfigLoader configLoader,
       ConfigWriter configWriter,
       InMemorySessionStore sessionStore,
+      SqliteMemoryStore sqlMemory,
+      OpenClawToolRegistry toolRegistry,
+      OpenClawPluginLoader pluginLoader,
       Environment env) {
     this.configLoader = configLoader;
     this.configWriter = configWriter;
     this.sessionStore = sessionStore;
+    this.sqlMemory = sqlMemory;
+    this.toolRegistry = toolRegistry;
+    this.pluginLoader = pluginLoader;
     this.gatewayToken = env.getProperty("OPENCLAW_GATEWAY_TOKEN", "");
     Map<String, WsMethodHandler> handlers = new LinkedHashMap<>();
     handlers.put("health", (session, req, params) -> handleHealth(session, req, params));
@@ -442,6 +459,11 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
         (session, req, params) -> handleSessionsMessagesUnsubscribe(session, req, params));
     handlers.put("chat.send", (session, req, params) -> handleChatSend(session, req, params));
     handlers.put("llm.config.set", (session, req, params) -> handleLlmConfigSet(session, req, params));
+    handlers.put("memory.put", (session, req, params) -> handleMemoryPut(session, req, params));
+    handlers.put("memory.search", (session, req, params) -> handleMemorySearch(session, req, params));
+    handlers.put("plugins.list", (session, req, params) -> handlePluginsList(session, req, params));
+    handlers.put(
+        "agent.tools.list", (session, req, params) -> handleAgentToolsList(session, req, params));
     handlers.put("status", (session, req, params) -> handleStatus(session, req));
     this.methodHandlers = handlers;
   }
@@ -895,6 +917,10 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     if (b.contains("/chat/completions")) {
       return b;
     }
+    // Volcengine CodingPlan OpenAI-compatible base (avoid appending /v1/chat/completions).
+    if (b.endsWith("/api/coding/v3")) {
+      return b + "/chat/completions";
+    }
     if (b.endsWith("/v1")) {
       return b + "/chat/completions";
     }
@@ -951,6 +977,92 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
         null,
         null,
         null);
+  }
+
+  private void handleMemoryPut(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String agentId = optionalNonEmptyString(params, "agentId");
+    if (agentId == null) agentId = "default";
+    String path = optionalNonEmptyString(params, "path");
+    String content = optionalNonEmptyString(params, "content");
+    if (path == null || content == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "memory.put: path and content required"));
+      return;
+    }
+    try {
+      sqlMemory.put(agentId, path, content);
+    } catch (Exception e) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "memory.put: " + e.getMessage()));
+      return;
+    }
+    sendResponse(session, req.getId(), true, Map.of("ok", true, "agentId", agentId), null);
+  }
+
+  private void handleMemorySearch(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String agentId = optionalNonEmptyString(params, "agentId");
+    if (agentId == null) agentId = "default";
+    String query = optionalNonEmptyString(params, "query");
+    if (query == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "memory.search: query required"));
+      return;
+    }
+    int limit = optionalPositiveInt(params, "limit", 20);
+    try {
+      List<MemoryHit> hits = sqlMemory.search(agentId, query, limit);
+      List<Map<String, Object>> rows = new ArrayList<>();
+      for (MemoryHit h : hits) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("id", h.id());
+        row.put("path", h.path());
+        row.put("content", h.content());
+        row.put("createdAtMs", h.createdAtMs());
+        rows.add(row);
+      }
+      Map<String, Object> payload = new LinkedHashMap<>();
+      payload.put("agentId", agentId);
+      payload.put("query", query);
+      payload.put("hits", rows);
+      sendResponse(session, req.getId(), true, payload, null);
+    } catch (Exception e) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "memory.search: " + e.getMessage()));
+    }
+  }
+
+  @SuppressWarnings("unused")
+  private void handlePluginsList(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("plugins", pluginLoader.listLoaded());
+    sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  @SuppressWarnings("unused")
+  private void handleAgentToolsList(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("tools", toolRegistry.openAiTools());
+    sendResponse(session, req.getId(), true, payload, null);
   }
 
   private void handleSessionsCreate(
@@ -1188,12 +1300,41 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
           new ArrayList<>();
       java.util.List<Map<String, Object>> llmMessagesPayload = new ArrayList<>();
 
+      List<MemoryHit> memoryHits = List.of();
+      try {
+        memoryHits = sqlMemory.search(entry.agentId, lastUserMessage, 16);
+      } catch (Exception ignored) {
+        memoryHits = List.of();
+      }
+      String memoryBlock = sqlMemory.formatHitsForPrompt(memoryHits, 8000);
+      StringBuilder systemText = new StringBuilder();
       if (cfg.systemPrompt != null && !cfg.systemPrompt.isBlank()) {
-        llmMessages.add(new OpenAiCompatibleChatClient.ChatMessage("system", cfg.systemPrompt));
-        Map<String, Object> sys = new LinkedHashMap<>();
-        sys.put("role", "system");
-        sys.put("content", cfg.systemPrompt);
-        llmMessagesPayload.add(sys);
+        systemText.append(cfg.systemPrompt.trim());
+      }
+      if (!memoryBlock.isBlank()) {
+        if (systemText.length() > 0) {
+          systemText.append("\n\n");
+        }
+        systemText.append("Relevant memory:\n").append(memoryBlock);
+      }
+      if (systemText.length() > 0) {
+        String sysCombined = systemText.toString();
+        llmMessages.add(new OpenAiCompatibleChatClient.ChatMessage("system", sysCombined));
+        Map<String, Object> sysMap = new LinkedHashMap<>();
+        sysMap.put("role", "system");
+        sysMap.put("content", sysCombined);
+        llmMessagesPayload.add(sysMap);
+      }
+
+      if (!memoryHits.isEmpty()) {
+        Map<String, Object> memTrace = new LinkedHashMap<>();
+        memTrace.put("ts", System.currentTimeMillis());
+        memTrace.put("agentId", entry.agentId);
+        memTrace.put("hitCount", memoryHits.size());
+        memTrace.put(
+            "topPaths",
+            memoryHits.stream().map(MemoryHit::path).distinct().limit(8).toList());
+        sessionStore.addEvent(sessionKey, "memory.context", memTrace);
       }
 
       for (int i = 0; i < history.size(); i++) {
@@ -1212,6 +1353,7 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       reqTrace.put("chatCompletionsUrl", cfg.chatCompletionsUrl);
       reqTrace.put("temperature", cfg.temperature);
       reqTrace.put("maxTokens", cfg.maxTokens);
+      reqTrace.put("memoryHitCount", memoryHits.size());
       if (cfg.systemPrompt != null && !cfg.systemPrompt.isBlank()) {
         reqTrace.put("systemPrompt", cfg.systemPrompt);
       }

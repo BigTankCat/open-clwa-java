@@ -74,7 +74,10 @@ public final class MethodScopes {
           "config.schema.lookup",
           "talk.config",
           "agents.files.list",
-          "agents.files.get");
+          "agents.files.get",
+          "memory.search",
+          "plugins.list",
+          "agent.tools.list");
 
   private static final Set<String> WRITE_METHODS =
       Set.of(
@@ -98,7 +101,8 @@ public final class MethodScopes {
           "browser.request",
           "push.test",
           "node.pending.enqueue",
-          "llm.config.set");
+          "llm.config.set",
+          "memory.put");
 
   private static final Set<String> ADMIN_METHODS =
       Set.of(

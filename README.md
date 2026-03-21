@@ -7,12 +7,20 @@
 | 模块 | 说明 |
 |------|------|
 | `openclaw-protocol` | 协议 DTO：WebSocket 帧（req/res/event）、错误码与 ErrorShape |
-| `openclaw-config` | 配置路径（state dir、config 文件）、JSON 配置加载 |
+| `openclaw-config` | 配置路径（state dir、config 文件）、JSON5 加载、`$include`、`${ENV}` 等 |
+| `openclaw-llm` | OpenAI 兼容 `chat/completions` HTTP 客户端（供网关与后续 Agent 复用） |
+| `openclaw-memory` | 本地 SQLite 记忆库（首版：按 agentId 分库、`memory.put` / `memory.search`、LIKE 检索） |
+| `openclaw-plugin-api` | 插件 SPI：`OpenClawPlugin` + `ServiceLoader` 发现 |
+| `openclaw-agent` | Agent 工具链骨架：`OpenClawToolRegistry`、内置 `echo` 工具定义（OpenAI `tools[]` 形状） |
 | `openclaw-gateway` | Spring Boot Gateway：HTTP 健康检查、WebSocket JSON-RPC、鉴权与方法 scope |
 
 ## 与 Node 实现的对应关系
 
-- **配置与路径**：`openclaw-config` 对应 Node 的 `src/config/paths.ts`、`src/config/io.ts`（本实现为简化版：仅 JSON，无 JSON5/include/env 替换）。
+- **配置与路径**：`openclaw-config` 对应 Node 的 `src/config/paths.ts`、配置加载与合并（JSON5、`$include`、`${ENV}` 等）。
+- **Memory（SQLite）**：`openclaw-memory` 对应 Node `src/memory` 的**本地索引**思路；当前 Java 首版为文本块 + LIKE 搜索，**尚无** `sqlite-vec` 级向量检索与完整 QMD 同步。
+- **插件**：`openclaw-plugin-api` 提供 SPI；网关在启动时 `ServiceLoader` 加载实现类（需在 JAR 的 `META-INF/services/ai.openclaw.plugin.api.OpenClawPlugin` 中登记）。
+- **Agent / 工具链**：`openclaw-agent` 提供工具注册表与 OpenAI 形态的工具描述；**完整多轮 tool-call 执行循环**仍在网关侧迭代中。
+- **桌面 / 移动端**：与 Node 主仓库一致，**不在** `openclaw-java` 内实现；macOS/iOS/Android 客户端仍在主工程 `apps/*`（Swift/Kotlin 等）。Java 网关通过 WebSocket/HTTP 对接这些客户端即可。
 - **协议**：`openclaw-protocol` 对应 `src/gateway/protocol/`（ErrorCodes、ErrorShape、Request/Response/Event 帧）。
 - **鉴权与 scope**：`MethodScopes` 对应 `src/gateway/method-scopes.ts`（operator.read/write/admin 等）。
 - **HTTP**：`/health`、`/healthz`（存活）、`/ready`、`/readyz`（就绪）对应 Node `server-http.ts`。
