@@ -7,6 +7,9 @@ import ai.openclaw.config.ConfigParsers;
 import ai.openclaw.gateway.auth.MethodScopes;
 import ai.openclaw.config.ConfigMergePatch;
 import ai.openclaw.config.ConfigEnvRestorer;
+import ai.openclaw.agent.runtime.AgentTurnRunner;
+import ai.openclaw.agent.runtime.LlmInvocationParams;
+import ai.openclaw.agent.runtime.OpenAiToolsMerge;
 import ai.openclaw.agent.tools.OpenClawToolRegistry;
 import ai.openclaw.gateway.plugins.OpenClawPluginLoader;
 import ai.openclaw.llm.OpenAiCompatibleChatClient;
@@ -1296,9 +1299,7 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       // Build OpenAI-compatible messages from the session transcript strings.
       // Naive role alternation: user (even index), assistant (odd index).
       List<String> history = sessionStore.listMessages(sessionKey, 50);
-      java.util.List<OpenAiCompatibleChatClient.ChatMessage> llmMessages =
-          new ArrayList<>();
-      java.util.List<Map<String, Object>> llmMessagesPayload = new ArrayList<>();
+      java.util.List<OpenAiCompatibleChatClient.ChatMessage> llmMessages = new ArrayList<>();
 
       List<MemoryHit> memoryHits = List.of();
       try {
@@ -1319,11 +1320,7 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       }
       if (systemText.length() > 0) {
         String sysCombined = systemText.toString();
-        llmMessages.add(new OpenAiCompatibleChatClient.ChatMessage("system", sysCombined));
-        Map<String, Object> sysMap = new LinkedHashMap<>();
-        sysMap.put("role", "system");
-        sysMap.put("content", sysCombined);
-        llmMessagesPayload.add(sysMap);
+        llmMessages.add(OpenAiCompatibleChatClient.ChatMessage.system(sysCombined));
       }
 
       if (!memoryHits.isEmpty()) {
@@ -1340,65 +1337,55 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       for (int i = 0; i < history.size(); i++) {
         String content = history.get(i);
         String role = (i % 2 == 0) ? "user" : "assistant";
-        llmMessages.add(new OpenAiCompatibleChatClient.ChatMessage(role, content));
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put("role", role);
-        m.put("content", content);
-        llmMessagesPayload.add(m);
+        if ("user".equals(role)) {
+          llmMessages.add(OpenAiCompatibleChatClient.ChatMessage.user(content));
+        } else {
+          llmMessages.add(OpenAiCompatibleChatClient.ChatMessage.assistantText(content));
+        }
       }
 
-      Map<String, Object> reqTrace = new LinkedHashMap<>();
-      reqTrace.put("ts", System.currentTimeMillis());
-      reqTrace.put("model", cfg.model);
-      reqTrace.put("chatCompletionsUrl", cfg.chatCompletionsUrl);
-      reqTrace.put("temperature", cfg.temperature);
-      reqTrace.put("maxTokens", cfg.maxTokens);
-      reqTrace.put("memoryHitCount", memoryHits.size());
-      if (cfg.systemPrompt != null && !cfg.systemPrompt.isBlank()) {
-        reqTrace.put("systemPrompt", cfg.systemPrompt);
+      OpenAiToolsMerge.MergeResult merged =
+          OpenAiToolsMerge.mergeWithReport(toolRegistry.openAiTools(), cfg.tools);
+      if (!merged.overriddenNames().isEmpty()) {
+        Map<String, Object> mergeTrace = new LinkedHashMap<>();
+        mergeTrace.put("ts", System.currentTimeMillis());
+        mergeTrace.put("overriddenToolNames", merged.overriddenNames());
+        sessionStore.addEvent(sessionKey, "agent.tools.merge", mergeTrace);
       }
-      reqTrace.put("tools", cfg.tools);
-      reqTrace.put("toolChoice", cfg.toolChoice);
-      reqTrace.put("messages", llmMessagesPayload);
-      sessionStore.addEvent(sessionKey, "llm.request", reqTrace);
+      List<Map<String, Object>> mergedTools = merged.tools();
+      Object toolsParam = mergedTools.isEmpty() ? null : mergedTools;
+      Object toolChoiceParam = toolsParam == null ? null : cfg.toolChoice;
+
+      Map<String, Object> preTrace = new LinkedHashMap<>();
+      preTrace.put("ts", System.currentTimeMillis());
+      preTrace.put("memoryHitCount", memoryHits.size());
+      if (cfg.systemPrompt != null && !cfg.systemPrompt.isBlank()) {
+        preTrace.put("systemPrompt", cfg.systemPrompt);
+      }
+      preTrace.put("mergedToolCount", mergedTools.size());
+      sessionStore.addEvent(sessionKey, "agent.turn.start", preTrace);
 
       OpenAiCompatibleChatClient client = new OpenAiCompatibleChatClient();
-      OpenAiCompatibleChatClient.ChatResult result =
-          client.chatCompletions(
+      AgentTurnRunner runner = new AgentTurnRunner(client, toolRegistry, 8);
+      LlmInvocationParams inv =
+          new LlmInvocationParams(
               cfg.chatCompletionsUrl,
               cfg.apiKey,
               cfg.model,
-              llmMessages,
               cfg.temperature,
-              cfg.maxTokens,
-              cfg.tools,
-              cfg.toolChoice);
+              cfg.maxTokens);
+      String assistantText =
+          runner.run(
+              inv,
+              llmMessages,
+              toolsParam,
+              toolChoiceParam,
+              (type, payload) -> sessionStore.addEvent(sessionKey, type, payload));
 
-      JsonNode raw = result.raw();
-      JsonNode usage = result.usage();
-      JsonNode toolCalls = result.toolCalls();
-
-      Map<String, Object> respTrace = new LinkedHashMap<>();
-      respTrace.put("ts", System.currentTimeMillis());
-      respTrace.put("raw", raw);
-      sessionStore.addEvent(sessionKey, "llm.response", respTrace);
-
-      if (usage != null && !usage.isNull()) {
-        sessionStore.addEvent(sessionKey, "llm.usage", usage);
-      }
-      if (toolCalls != null && !toolCalls.isNull()) {
-        sessionStore.addEvent(sessionKey, "llm.tool_calls", toolCalls);
-      }
-
-      String assistantText = result.content();
       if (assistantText == null) assistantText = "";
       assistantText = assistantText.trim();
       if (assistantText.isBlank()) {
-        if (toolCalls != null && !toolCalls.isNull()) {
-          assistantText = "Tool calls: " + toolCalls.toString();
-        } else {
-          assistantText = "NO_REPLY";
-        }
+        assistantText = "NO_REPLY";
       }
 
       int before = entry.messages.size();

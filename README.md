@@ -11,7 +11,7 @@
 | `openclaw-llm` | OpenAI 兼容 `chat/completions` HTTP 客户端（供网关与后续 Agent 复用） |
 | `openclaw-memory` | 本地 SQLite 记忆库（首版：按 agentId 分库、`memory.put` / `memory.search`、LIKE 检索） |
 | `openclaw-plugin-api` | 插件 SPI：`OpenClawPlugin` + `ServiceLoader` 发现 |
-| `openclaw-agent` | Agent 工具链骨架：`OpenClawToolRegistry`、内置 `echo` 工具定义（OpenAI `tools[]` 形状） |
+| `openclaw-agent` | Agent 工具链：`OpenClawToolRegistry`、`AgentTurnRunner`（OpenAI `tool_calls` 多轮闭环）、内置 `echo` 工具 |
 | `openclaw-gateway` | Spring Boot Gateway：HTTP 健康检查、WebSocket JSON-RPC、鉴权与方法 scope |
 
 ## 与 Node 实现的对应关系
@@ -19,18 +19,30 @@
 - **配置与路径**：`openclaw-config` 对应 Node 的 `src/config/paths.ts`、配置加载与合并（JSON5、`$include`、`${ENV}` 等）。
 - **Memory（SQLite）**：`openclaw-memory` 对应 Node `src/memory` 的**本地索引**思路；当前 Java 首版为文本块 + LIKE 搜索，**尚无** `sqlite-vec` 级向量检索与完整 QMD 同步。
 - **插件**：`openclaw-plugin-api` 提供 SPI；网关在启动时 `ServiceLoader` 加载实现类（需在 JAR 的 `META-INF/services/ai.openclaw.plugin.api.OpenClawPlugin` 中登记）。
-- **Agent / 工具链**：`openclaw-agent` 提供工具注册表与 OpenAI 形态的工具描述；**完整多轮 tool-call 执行循环**仍在网关侧迭代中。
+- **Agent / 工具链**：`chat.send` 触发的 LLM 路径使用 `AgentTurnRunner`：模型返回 `tool_calls` 时按名称调用 `OpenClawToolRegistry.execute`，将 `role=tool` 结果写回对话并再次请求模型，默认最多 **8** 轮（见 `AgentTurnRunner` 构造参数）。**会话 transcript** 仍只追加最终 assistant 文本；中间轮次与工具 I/O 在 trace 中查看。
+- **Tools 合并**：内置 registry（如 `echo`）与 `llm.config.set` 的 `tools` 合并为一份请求列表；**同名 function 以用户配置覆盖**，并写入 trace 事件 `agent.tools.merge`（`overriddenToolNames`）。若无任何 tool，则不传 `tools`/`tool_choice`。
 - **桌面 / 移动端**：与 Node 主仓库一致，**不在** `openclaw-java` 内实现；macOS/iOS/Android 客户端仍在主工程 `apps/*`（Swift/Kotlin 等）。Java 网关通过 WebSocket/HTTP 对接这些客户端即可。
 - **协议**：`openclaw-protocol` 对应 `src/gateway/protocol/`（ErrorCodes、ErrorShape、Request/Response/Event 帧）。
 - **鉴权与 scope**：`MethodScopes` 对应 `src/gateway/method-scopes.ts`（operator.read/write/admin 等）。
 - **HTTP**：`/health`、`/healthz`（存活）、`/ready`、`/readyz`（就绪）对应 Node `server-http.ts`。
 - **WebSocket**：`/ws` 上 JSON-RPC，先发 `connect`（可选 token/scopes），再支持 `health`、`config.get` 等方法。
 
+## Trace 事件（与会话 `*.jsonl`）
+
+与一次 `chat.send` → LLM 相关的典型事件包括：
+
+- `agent.turn.start`：本轮开始摘要（如 `memoryHitCount`、`mergedToolCount`）。
+- `llm.request` / `llm.response` / `llm.usage`：每一轮对厂商的请求与响应（多轮 tool 时会各出现多次）。
+- `agent.tool_calls`：模型返回的 `tool_calls`（含 `round`）。
+- `agent.tool_result`：每个工具执行结果摘要（`content` 在 trace 中截断）。
+- `agent.tools.merge`：用户 `tools` 覆盖了哪些内置工具名。
+
 ## 构建与运行
 
 - **要求**：JDK 21+、Maven 3.9+
 - **构建**：在 `openclaw-java` 目录下执行  
   `mvn clean install`
+- **单测（推荐）**：`mvn test -pl openclaw-llm,openclaw-agent -am`
 - **运行 Gateway**：  
   `cd openclaw-gateway && mvn spring-boot:run`  
   或指定端口：  
