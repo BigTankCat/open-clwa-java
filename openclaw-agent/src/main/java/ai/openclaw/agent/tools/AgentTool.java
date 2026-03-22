@@ -1,5 +1,6 @@
 package ai.openclaw.agent.tools;
 
+import ai.openclaw.agent.runtime.ToolExecutionContext;
 import java.util.Map;
 
 /**
@@ -20,5 +21,5 @@ public interface AgentTool {
    *
    * @return Result string stored as the tool message {@code content} (often JSON or plain text).
    */
-  String execute(String argumentsJson) throws Exception;
+  String execute(String argumentsJson, ToolExecutionContext ctx) throws Exception;
 }

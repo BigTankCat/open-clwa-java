@@ -37,10 +37,15 @@ public class InMemorySessionStore {
     public final String parentSessionKey;
     public volatile String label;
     public volatile String model;
+    /** Web UI / Node {@code sessions.patch} fields (optional). */
+    public volatile String thinkingLevel;
+
+    public volatile String verboseLevel;
+    public volatile Boolean fastMode;
     public final long createdAt;
     public volatile long updatedAt;
 
-    // For the first slice we only keep message strings.
+    // Transcript lines for LLM: even index = user, odd = assistant (legacy string list).
     public final List<String> messages;
 
     SessionEntry(
@@ -148,6 +153,94 @@ public class InMemorySessionStore {
     }
   }
 
+  /**
+   * Open-WebChat-compatible messages: {@code role} + {@code content} array with {@code
+   * type}/{@code text}, plus {@code timestamp}.
+   */
+  public List<Map<String, Object>> buildChatHistoryMessages(String key, int limit) {
+    SessionEntry entry = sessions.get(key);
+    if (entry == null) return List.of();
+    int hardMax = 1000;
+    int lim = limit > 0 ? Math.min(hardMax, limit) : 200;
+    List<String> slice;
+    synchronized (entry.messages) {
+      int size = entry.messages.size();
+      int start = Math.max(0, size - lim);
+      slice = new ArrayList<>(entry.messages.subList(start, size));
+    }
+    long tsBase = entry.updatedAt;
+    List<Map<String, Object>> out = new ArrayList<>();
+    for (int i = 0; i < slice.size(); i++) {
+      String text = slice.get(i);
+      if (text == null) {
+        continue;
+      }
+      String role = (i % 2 == 0) ? "user" : "assistant";
+      Map<String, Object> contentPart = new LinkedHashMap<>();
+      contentPart.put("type", "text");
+      contentPart.put("text", text);
+      Map<String, Object> m = new LinkedHashMap<>();
+      m.put("role", role);
+      m.put("content", List.of(contentPart));
+      m.put("timestamp", tsBase - (slice.size() - i));
+      out.add(m);
+    }
+    return out;
+  }
+
+  public void patchSession(String key, Map<String, Object> patch) {
+    SessionEntry entry = sessions.get(key);
+    if (entry == null || patch == null) {
+      return;
+    }
+    if (patch.containsKey("label")) {
+      Object v = patch.get("label");
+      entry.label = v instanceof String s ? s : entry.label;
+    }
+    if (patch.containsKey("model")) {
+      Object v = patch.get("model");
+      entry.model = v instanceof String s ? s : entry.model;
+    }
+    if (patch.containsKey("thinkingLevel")) {
+      Object v = patch.get("thinkingLevel");
+      entry.thinkingLevel = v instanceof String s ? s : null;
+    }
+    if (patch.containsKey("verboseLevel")) {
+      Object v = patch.get("verboseLevel");
+      entry.verboseLevel = v instanceof String s ? s : null;
+    }
+    if (patch.containsKey("fastMode")) {
+      Object v = patch.get("fastMode");
+      if (v instanceof Boolean b) {
+        entry.fastMode = b;
+      }
+    }
+    entry.updatedAt = System.currentTimeMillis();
+    persistMeta(entry);
+  }
+
+  /** Clears in-memory transcript and rewrites the jsonl transcript file (keeps meta). */
+  public void resetTranscript(String key) {
+    SessionEntry entry = sessions.get(key);
+    if (entry == null) {
+      return;
+    }
+    synchronized (entry.messages) {
+      entry.messages.clear();
+    }
+    entry.updatedAt = System.currentTimeMillis();
+    ioLock.lock();
+    try {
+      Path f = transcriptPathForKey(key);
+      Files.deleteIfExists(f);
+    } catch (Exception ignored) {
+      // best-effort
+    } finally {
+      ioLock.unlock();
+    }
+    persistMeta(entry);
+  }
+
   public List<Map<String, Object>> listTrace(String key, int limit) {
     if (limit <= 0) return List.of();
     Path file = transcriptPathForKey(key);
@@ -205,6 +298,9 @@ public class InMemorySessionStore {
       row.put("parentSessionKey", e.parentSessionKey);
       row.put("label", e.label);
       row.put("model", e.model);
+      row.put("thinkingLevel", e.thinkingLevel);
+      row.put("verboseLevel", e.verboseLevel);
+      row.put("fastMode", e.fastMode);
       row.put("updatedAt", e.updatedAt);
       row.put("runtimeMs", null);
       row.put("status", "ok");
@@ -245,6 +341,13 @@ public class InMemorySessionStore {
         String parentSessionKey = (String) metaMap.getOrDefault("parentSessionKey", null);
         String label = (String) metaMap.getOrDefault("label", null);
         String model = (String) metaMap.getOrDefault("model", null);
+        String thinkingLevel = (String) metaMap.getOrDefault("thinkingLevel", null);
+        String verboseLevel = (String) metaMap.getOrDefault("verboseLevel", null);
+        Boolean fastMode = null;
+        Object fm = metaMap.get("fastMode");
+        if (fm instanceof Boolean b) {
+          fastMode = b;
+        }
 
         long createdAt = toLong(metaMap.get("createdAt"), System.currentTimeMillis());
         long updatedAt = toLong(metaMap.get("updatedAt"), createdAt);
@@ -262,6 +365,9 @@ public class InMemorySessionStore {
                 createdAt,
                 updatedAt,
                 messages);
+        entry.thinkingLevel = thinkingLevel;
+        entry.verboseLevel = verboseLevel;
+        entry.fastMode = fastMode;
         sessions.put(key, entry);
       }
     }
@@ -312,6 +418,9 @@ public class InMemorySessionStore {
       meta.put("parentSessionKey", entry.parentSessionKey);
       meta.put("label", entry.label);
       meta.put("model", entry.model);
+      meta.put("thinkingLevel", entry.thinkingLevel);
+      meta.put("verboseLevel", entry.verboseLevel);
+      meta.put("fastMode", entry.fastMode);
       meta.put("createdAt", entry.createdAt);
       meta.put("updatedAt", entry.updatedAt);
       MAPPER.writeValue(metaPathForKey(entry.key).toFile(), meta);

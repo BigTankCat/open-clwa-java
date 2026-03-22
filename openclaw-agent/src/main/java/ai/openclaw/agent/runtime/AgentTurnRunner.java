@@ -49,8 +49,11 @@ public final class AgentTurnRunner {
       List<ChatMessage> conversation,
       Object tools,
       Object toolChoice,
+      ToolExecutionContext toolCtx,
       AgentTraceSink sink)
       throws Exception {
+    ToolExecutionContext ctx =
+        toolCtx != null ? toolCtx : ToolExecutionContext.defaultContext();
     for (int round = 0; round < maxToolRounds; round++) {
       traceLlmRequest(sink, params, conversation, tools, toolChoice);
       ChatResult result =
@@ -99,7 +102,7 @@ public final class AgentTurnRunner {
         if (args == null || args.isBlank()) {
           args = "{}";
         }
-        String output = registry.execute(fnName, args);
+        String output = registry.execute(fnName, args, ctx);
         Map<String, Object> resPayload = new LinkedHashMap<>();
         resPayload.put("ts", System.currentTimeMillis());
         resPayload.put("round", round);

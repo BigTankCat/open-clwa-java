@@ -7,9 +7,20 @@ import ai.openclaw.config.ConfigParsers;
 import ai.openclaw.gateway.auth.MethodScopes;
 import ai.openclaw.config.ConfigMergePatch;
 import ai.openclaw.config.ConfigEnvRestorer;
+import ai.openclaw.gateway.config.ConfigRpcSupport;
+import ai.openclaw.gateway.autonomous.AutonomousGoalService;
+import ai.openclaw.gateway.chat.ChatRunRegistry;
+import ai.openclaw.gateway.cron.GatewayCronService;
+import ai.openclaw.gateway.node.NodeInvokeService;
+import ai.openclaw.gateway.node.NodeInvokeService.NodeInvokeResolution;
+import ai.openclaw.gateway.nodebridge.BrowserProxyNodeBridge;
+import ai.openclaw.gateway.nodebridge.BrowserProxyNodeBridge.BrowserRequestOutcome;
+import ai.openclaw.gateway.skills.GatewaySkillsService;
+import ai.openclaw.gateway.skills.SkillsWsParams;
 import ai.openclaw.agent.runtime.AgentTurnRunner;
 import ai.openclaw.agent.runtime.LlmInvocationParams;
 import ai.openclaw.agent.runtime.OpenAiToolsMerge;
+import ai.openclaw.agent.runtime.ToolExecutionContext;
 import ai.openclaw.agent.tools.OpenClawToolRegistry;
 import ai.openclaw.gateway.plugins.OpenClawPluginLoader;
 import ai.openclaw.llm.OpenAiCompatibleChatClient;
@@ -23,12 +34,15 @@ import ai.openclaw.protocol.ErrorShape;
 import ai.openclaw.protocol.RequestFrame;
 import ai.openclaw.protocol.ResponseFrame;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.util.HexFormat;
 import java.util.Set;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -41,6 +55,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.BiConsumer;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Component;
@@ -58,8 +73,9 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
 
   private static final ObjectMapper MAPPER = new ObjectMapper();
   private static final long HEALTH_REFRESH_INTERVAL_MS = 60_000;
-  private static final Set<String> EVENT_SLOTS =
-      Set.of("sessions.changed", "sessions.messages");
+  /** Subset of events we actually emit today (Web UI + sessions). */
+  private static final Set<String> EMITTABLE_EVENTS =
+      Set.of("sessions.changed", "sessions.messages", "chat", "autonomous.goal");
 
   // Align with Node server-methods-list.ts:
   // - BASE_METHODS are advertised in hello-ok.features.methods.
@@ -172,7 +188,15 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
           "browser.request",
           "chat.history",
           "chat.abort",
+          "autonomous.goals.create",
+          "autonomous.goals.get",
+          "autonomous.goals.list",
+          "autonomous.goals.patch",
           "chat.send");
+
+  /** Extra gateway events this Java port declares beyond {@link #NODE_GATEWAY_EVENTS}. */
+  private static final List<String> EVENT_SLOTS =
+      List.of("session.tool", "session.message", "autonomous.goal");
 
   // Note: Node base methods list doesn't include `poll` (it is implemented as a gateway
   // method, but not part of base feature negotiation). We still advertise it for compatibility.
@@ -295,28 +319,6 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
   private volatile Map<String, Object> cachedHealthPayload;
   private volatile long cachedHealthTs;
 
-  // Minimal in-memory node action queue + invoke-result waiting.
-  private static final ConcurrentHashMap<String, ConcurrentLinkedQueue<PendingNodeAction>>
-      NODE_PENDING_ACTIONS_BY_NODE_ID = new ConcurrentHashMap<>();
-  private static final long NODE_PENDING_ACTION_TTL_MS = 10 * 60_000;
-  private static final int NODE_PENDING_ACTION_MAX_PER_NODE = 64;
-  private static final ConcurrentHashMap<String, CompletableFuture<NodeInvokeResolution>>
-      NODE_INVOKE_WAITERS_BY_ID = new ConcurrentHashMap<>();
-  private static final ConcurrentHashMap<String, PendingNodeInvokeMeta>
-      NODE_INVOKE_META_BY_ID = new ConcurrentHashMap<>();
-
-  private static final ExecutorService NODE_INVOKE_EXECUTOR =
-      Executors.newCachedThreadPool(
-          new ThreadFactory() {
-            @Override
-            public Thread newThread(Runnable r) {
-              Thread t = new Thread(r);
-              t.setDaemon(true);
-              t.setName("openclaw-node-invoke-waiter");
-              return t;
-            }
-          });
-
   private static final ConcurrentHashMap<String, Map<String, Object>> POLL_DEDUPE_BY_ID =
       new ConcurrentHashMap<>();
 
@@ -330,6 +332,15 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
   private static final Map<String, Integer> PRIORITY_RANK =
       Map.of("high", 3, "normal", 2, "default", 1);
 
+  private static final String DEFAULT_REFLECTION_PROMPT =
+      "Review your previous reply in this conversation (including tool calls already reflected above). "
+          + "If anything is incomplete, incorrect, or missing relative to the user's goal, produce an improved final answer. "
+          + "If the previous answer is fully adequate, you may repeat it unchanged or briefly confirm.";
+
+  private record ChatSendLlmOptions(int reflectionRounds, String reflectionPrompt, String autonomousGoalId) {
+    private static final ChatSendLlmOptions DEFAULT = new ChatSendLlmOptions(0, null, null);
+  }
+
   private static final class PendingNodeDrainWorkState {
     long revision;
     final Map<String, PendingNodeDrainWork> itemsById = new HashMap<>();
@@ -337,46 +348,6 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
 
   private static final ConcurrentHashMap<String, PendingNodeDrainWorkState>
       NODE_DRAIN_STATE_BY_NODE_ID = new ConcurrentHashMap<>();
-
-  private static final class PendingNodeAction {
-    final String id;
-    final String command;
-    final String paramsJSON;
-    final long enqueuedAtMs;
-
-    PendingNodeAction(String id, String command, String paramsJSON, long enqueuedAtMs) {
-      this.id = id;
-      this.command = command;
-      this.paramsJSON = paramsJSON;
-      this.enqueuedAtMs = enqueuedAtMs;
-    }
-  }
-
-  private static final class PendingNodeInvokeMeta {
-    final String nodeId;
-    final String command;
-    final String sessionKey;
-
-    PendingNodeInvokeMeta(String nodeId, String command, String sessionKey) {
-      this.nodeId = nodeId;
-      this.command = command;
-      this.sessionKey = sessionKey;
-    }
-  }
-
-  private static final class NodeInvokeResolution {
-    final boolean ok;
-    final Object payload;
-    final String payloadJSON;
-    final ErrorShape error;
-
-    NodeInvokeResolution(boolean ok, Object payload, String payloadJSON, ErrorShape error) {
-      this.ok = ok;
-      this.payload = payload;
-      this.payloadJSON = payloadJSON;
-      this.error = error;
-    }
-  }
 
   private static final class PendingNodeDrainWork {
     final String id;
@@ -401,6 +372,12 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
   private final SqliteMemoryStore sqlMemory;
   private final OpenClawToolRegistry toolRegistry;
   private final OpenClawPluginLoader pluginLoader;
+  private final GatewaySkillsService gatewaySkillsService;
+  private final NodeInvokeService nodeInvoke;
+  private final BrowserProxyNodeBridge browserProxyNodeBridge;
+  private final ChatRunRegistry chatRunRegistry;
+  private final GatewayCronService gatewayCronService;
+  private final AutonomousGoalService autonomousGoalService;
 
   public GatewayWebSocketHandler(
       ConfigLoader configLoader,
@@ -409,6 +386,12 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       SqliteMemoryStore sqlMemory,
       OpenClawToolRegistry toolRegistry,
       OpenClawPluginLoader pluginLoader,
+      GatewaySkillsService gatewaySkillsService,
+      NodeInvokeService nodeInvoke,
+      BrowserProxyNodeBridge browserProxyNodeBridge,
+      ChatRunRegistry chatRunRegistry,
+      GatewayCronService gatewayCronService,
+      AutonomousGoalService autonomousGoalService,
       Environment env) {
     this.configLoader = configLoader;
     this.configWriter = configWriter;
@@ -416,9 +399,18 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     this.sqlMemory = sqlMemory;
     this.toolRegistry = toolRegistry;
     this.pluginLoader = pluginLoader;
+    this.gatewaySkillsService = gatewaySkillsService;
+    this.nodeInvoke = nodeInvoke;
+    this.browserProxyNodeBridge = browserProxyNodeBridge;
+    this.chatRunRegistry = chatRunRegistry;
+    this.gatewayCronService = gatewayCronService;
+    this.autonomousGoalService = autonomousGoalService;
     this.gatewayToken = env.getProperty("OPENCLAW_GATEWAY_TOKEN", "");
     Map<String, WsMethodHandler> handlers = new LinkedHashMap<>();
     handlers.put("health", (session, req, params) -> handleHealth(session, req, params));
+    handlers.put("models.list", (session, req, params) -> handleModelsList(session, req, params));
+    handlers.put("agents.list", (session, req, params) -> handleAgentsList(session, req, params));
+    handlers.put("channels.status", (session, req, params) -> handleChannelsStatus(session, req, params));
     handlers.put("poll", (session, req, params) -> handlePoll(session, req, params));
     handlers.put("config.get", (session, req, params) -> handleConfigGet(session, req, params));
     handlers.put("config.apply", (session, req, params) -> handleConfigApply(session, req, params));
@@ -461,6 +453,17 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
         "sessions.messages.unsubscribe",
         (session, req, params) -> handleSessionsMessagesUnsubscribe(session, req, params));
     handlers.put("chat.send", (session, req, params) -> handleChatSend(session, req, params));
+    handlers.put(
+        "autonomous.goals.create",
+        (session, req, params) -> handleAutonomousGoalsCreate(session, req, params));
+    handlers.put(
+        "autonomous.goals.get", (session, req, params) -> handleAutonomousGoalsGet(session, req, params));
+    handlers.put(
+        "autonomous.goals.list",
+        (session, req, params) -> handleAutonomousGoalsList(session, req, params));
+    handlers.put(
+        "autonomous.goals.patch",
+        (session, req, params) -> handleAutonomousGoalsPatch(session, req, params));
     handlers.put("llm.config.set", (session, req, params) -> handleLlmConfigSet(session, req, params));
     handlers.put("memory.put", (session, req, params) -> handleMemoryPut(session, req, params));
     handlers.put("memory.search", (session, req, params) -> handleMemorySearch(session, req, params));
@@ -468,6 +471,56 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     handlers.put(
         "agent.tools.list", (session, req, params) -> handleAgentToolsList(session, req, params));
     handlers.put("status", (session, req, params) -> handleStatus(session, req));
+    handlers.put("skills.status", (session, req, params) -> handleSkillsStatus(session, req, params));
+    handlers.put("skills.bins", (session, req, params) -> handleSkillsBins(session, req, params));
+    handlers.put("skills.install", (session, req, params) -> handleSkillsInstall(session, req, params));
+    handlers.put("skills.update", (session, req, params) -> handleSkillsUpdate(session, req, params));
+    handlers.put("chat.history", (session, req, params) -> handleChatHistory(session, req, params));
+    handlers.put("chat.abort", (session, req, params) -> handleChatAbort(session, req, params));
+    handlers.put("sessions.patch", (session, req, params) -> handleSessionsPatch(session, req, params));
+    handlers.put("sessions.reset", (session, req, params) -> handleSessionsReset(session, req, params));
+    handlers.put(
+        "sessions.compact", (session, req, params) -> handleSessionsCompact(session, req, params));
+    handlers.put("config.set", (session, req, params) -> handleConfigSet(session, req, params));
+    handlers.put("logs.tail", (session, req, params) -> handleLogsTail(session, req, params));
+    handlers.put("last-heartbeat", (session, req, params) -> handleLastHeartbeat(session, req, params));
+    handlers.put(
+        "agent.identity.get", (session, req, params) -> handleAgentIdentityGet(session, req, params));
+    handlers.put(
+        "system-presence", (session, req, params) -> handleSystemPresence(session, req, params));
+    handlers.put("usage.cost", (session, req, params) -> handleUsageCost(session, req, params));
+    handlers.put(
+        "sessions.usage", (session, req, params) -> handleSessionsUsage(session, req, params));
+    handlers.put(
+        "sessions.usage.timeseries",
+        (session, req, params) -> handleSessionsUsageTimeseries(session, req, params));
+    handlers.put(
+        "sessions.usage.logs", (session, req, params) -> handleSessionsUsageLogs(session, req, params));
+    handlers.put(
+        "exec.approval.resolve",
+        (session, req, params) -> handleExecApprovalResolve(session, req, params));
+    handlers.put(
+        "config.openFile", (session, req, params) -> handleConfigOpenFile(session, req, params));
+    handlers.put("tts.status", (session, req, params) -> handleTtsStatus(session, req, params));
+    handlers.put("tts.providers", (session, req, params) -> handleTtsProviders(session, req, params));
+    handlers.put(
+        "browser.request", (session, req, params) -> handleBrowserRequest(session, req, params));
+    handlers.put(
+        "device.pair.list", (session, req, params) -> handleDevicePairList(session, req, params));
+    handlers.put(
+        "device.pair.approve",
+        (session, req, params) -> handleDevicePairApprove(session, req, params));
+    handlers.put(
+        "device.pair.reject", (session, req, params) -> handleDevicePairReject(session, req, params));
+    handlers.put(
+        "device.token.revoke", (session, req, params) -> handleDeviceTokenRevoke(session, req, params));
+    handlers.put("cron.list", (session, req, params) -> handleCronList(session, req, params));
+    handlers.put("cron.status", (session, req, params) -> handleCronStatus(session, req, params));
+    handlers.put("cron.add", (session, req, params) -> handleCronAdd(session, req, params));
+    handlers.put("cron.update", (session, req, params) -> handleCronUpdate(session, req, params));
+    handlers.put("cron.remove", (session, req, params) -> handleCronRemove(session, req, params));
+    handlers.put("cron.run", (session, req, params) -> handleCronRun(session, req, params));
+    handlers.put("cron.runs", (session, req, params) -> handleCronRuns(session, req, params));
     this.methodHandlers = handlers;
   }
 
@@ -702,6 +755,78 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     cachedHealthPayload = payload;
     cachedHealthTs = now;
     sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  private void handleModelsList(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    if (!ConfigRpcSupport.isEmptyParamsOnly(params)) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "models.list: invalid params (expected {})"));
+      return;
+    }
+    try {
+      ConfigSnapshot snap = configLoader.load();
+      @SuppressWarnings("unchecked")
+      Map<String, Object> cfg = (Map<String, Object>) snap.getConfig();
+      List<Map<String, Object>> models = ConfigRpcSupport.buildModelsList(cfg);
+      sendResponse(session, req.getId(), true, Map.of("models", models), null);
+    } catch (Exception e) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.UNAVAILABLE, "models.list: " + e.getMessage()));
+    }
+  }
+
+  private void handleAgentsList(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    if (!ConfigRpcSupport.isEmptyParamsOnly(params)) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "agents.list: invalid params (expected {})"));
+      return;
+    }
+    try {
+      ConfigSnapshot snap = configLoader.load();
+      @SuppressWarnings("unchecked")
+      Map<String, Object> cfg = (Map<String, Object>) snap.getConfig();
+      Map<String, Object> payload = ConfigRpcSupport.buildAgentsListPayload(cfg);
+      sendResponse(session, req.getId(), true, payload, null);
+    } catch (Exception e) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.UNAVAILABLE, "agents.list: " + e.getMessage()));
+    }
+  }
+
+  @SuppressWarnings("unused")
+  private void handleChannelsStatus(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    List<Map<String, Object>> channels = new ArrayList<>();
+    Map<String, Object> http = new LinkedHashMap<>();
+    http.put("id", "http");
+    http.put("kind", "http");
+    http.put("enabled", true);
+    http.put(
+        "inbound",
+        Map.of(
+            "method", "POST",
+            "path", "/api/channel/http/message",
+            "auth", "Authorization: Bearer <OPENCLAW_GATEWAY_TOKEN>"));
+    channels.add(http);
+    sendResponse(session, req.getId(), true, Map.of("channels", channels), null);
   }
 
   private Map<String, Object> healthPayload() {
@@ -1035,6 +1160,7 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
         row.put("path", h.path());
         row.put("content", h.content());
         row.put("createdAtMs", h.createdAtMs());
+        row.put("chunkIndex", h.chunkIndex());
         rows.add(row);
       }
       Map<String, Object> payload = new LinkedHashMap<>();
@@ -1191,10 +1317,34 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     }
   }
 
+  private ChatSendLlmOptions parseChatSendLlmOptions(Map<String, Object> params) {
+    if (params == null) {
+      return ChatSendLlmOptions.DEFAULT;
+    }
+    int rr = 0;
+    Object o = params.get("reflectionRounds");
+    if (o instanceof Number n) {
+      rr = Math.min(3, Math.max(0, n.intValue()));
+    }
+    String rp = optionalNonEmptyString(params, "reflectionPrompt");
+    String ag = optionalNonEmptyString(params, "autonomousGoalId");
+    if (ag == null) {
+      ag = optionalNonEmptyString(params, "autonomousTaskId");
+    }
+    return new ChatSendLlmOptions(rr, rp, ag);
+  }
+
   private void handleChatSend(
       WebSocketSession session, RequestFrame req, Map<String, Object> params) {
     String sessionKey = optionalNonEmptyString(params, "sessionKey");
     String message = optionalNonEmptyString(params, "message");
+    if (message == null) {
+      message = "";
+    }
+    boolean hasAttachments =
+        params != null
+            && params.get("attachments") instanceof List<?> att
+            && !att.isEmpty();
     if (sessionKey == null) {
       sendResponse(
           session,
@@ -1204,13 +1354,24 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
           ErrorShape.of(ErrorCodes.INVALID_REQUEST, "chat.send: sessionKey required"));
       return;
     }
-    if (message == null) {
+    if (message.isBlank() && !hasAttachments) {
       sendResponse(
           session,
           req.getId(),
           false,
           null,
-          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "chat.send: message required"));
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "chat.send: message or attachments required"));
+      return;
+    }
+    if (hasAttachments) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(
+              ErrorCodes.INVALID_REQUEST,
+              "chat.send: attachments are not supported on the Java gateway yet"));
       return;
     }
 
@@ -1225,6 +1386,13 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       return;
     }
 
+    String runId = optionalNonEmptyString(params, "idempotencyKey");
+    if (runId == null) {
+      runId = UUID.randomUUID().toString();
+    }
+    ChatSendLlmOptions llmOpts = parseChatSendLlmOptions(params);
+    chatRunRegistry.register(sessionKey, runId, llmOpts.autonomousGoalId());
+
     int before = entry.messages.size();
     sessionStore.addMessage(sessionKey, message);
     int after = entry.messages.size();
@@ -1233,39 +1401,94 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     Map<String, Object> payload = new LinkedHashMap<>();
     payload.put("ok", true);
     payload.put("aborted", false);
-    payload.put("runIds", List.of());
+    payload.put("runId", runId);
+    payload.put("runIds", List.of(runId));
     payload.put("sessionKey", sessionKey);
     payload.put("messageSeq", messageSeq);
     sendResponse(session, req.getId(), true, payload, null);
 
-    // Push events to subscribers.
+    publishUserMessageSideEffects(sessionKey, message, messageSeq, "chat.send", llmOpts, runId);
+  }
+
+  /**
+   * HTTP channel inbound: append user message and schedule the same LLM path as {@code chat.send}
+   * (no WebSocket response).
+   *
+   * @return assigned {@code messageSeq}
+   */
+  public int ingestHttpChannelMessage(String sessionKey, String message) {
+    if (sessionKey == null || sessionKey.isBlank()) {
+      throw new IllegalArgumentException("sessionKey required");
+    }
+    if (message == null || message.isBlank()) {
+      throw new IllegalArgumentException("message required");
+    }
+    InMemorySessionStore.SessionEntry entry = sessionStore.get(sessionKey);
+    if (entry == null) {
+      throw new IllegalArgumentException("session not found");
+    }
+    int before = entry.messages.size();
+    sessionStore.addMessage(sessionKey, message);
+    int after = entry.messages.size();
+    int messageSeq = after > before ? before + 1 : after;
+    publishUserMessageSideEffects(
+        sessionKey,
+        message,
+        messageSeq,
+        "channel.http.message",
+        ChatSendLlmOptions.DEFAULT,
+        null);
+    return messageSeq;
+  }
+
+  private void publishUserMessageSideEffects(
+      String sessionKey,
+      String message,
+      int messageSeq,
+      String traceEventType,
+      ChatSendLlmOptions llmOptions,
+      String chatRunId) {
     emitSessionsChanged(sessionKey, "send");
     emitSessionsMessage(sessionKey, messageSeq, message);
 
-    // Record execution trace for UI debugging.
     Map<String, Object> tracePayload = new LinkedHashMap<>();
     tracePayload.put("messageSeq", messageSeq);
     tracePayload.put("message", message);
     tracePayload.put("ts", System.currentTimeMillis());
-    sessionStore.addEvent(sessionKey, "chat.send", tracePayload);
+    if (llmOptions != null && llmOptions.reflectionRounds() > 0) {
+      tracePayload.put("reflectionRounds", llmOptions.reflectionRounds());
+    }
+    sessionStore.addEvent(sessionKey, traceEventType, tracePayload);
 
-    // Background: call LLM and append assistant message + detailed trace.
-    // This keeps the WS request fast (Node emits assistant output asynchronously).
+    scheduleLlmAfterUserMessage(sessionKey, message, llmOptions, chatRunId);
+  }
+
+  private void scheduleLlmAfterUserMessage(
+      String sessionKey,
+      String lastUserMessage,
+      ChatSendLlmOptions llmOptions,
+      String chatRunId) {
     final String taskSessionKey = sessionKey;
-    final String lastUserMessage = message;
+    final ChatSendLlmOptions opts = llmOptions != null ? llmOptions : ChatSendLlmOptions.DEFAULT;
+    final String rid = chatRunId;
     LLM_EXECUTOR.submit(
         () -> {
           try {
-            handleLlmForChatSend(taskSessionKey, lastUserMessage);
+            handleLlmForChatSend(taskSessionKey, lastUserMessage, opts, rid);
           } catch (Exception e) {
-            handleLlmError(taskSessionKey, e);
+            handleLlmError(taskSessionKey, e, rid);
           }
         });
   }
 
-  private void handleLlmError(String sessionKey, Exception e) {
+  private void handleLlmError(String sessionKey, Exception e, String chatRunId) {
     InMemorySessionStore.SessionEntry entry = sessionStore.get(sessionKey);
-    if (entry == null) return;
+    if (entry == null) {
+      if (chatRunId != null) {
+        chatRunRegistry.unregister(sessionKey, chatRunId);
+      }
+      return;
+    }
     String assistantText = "LLM error: " + String.valueOf(e.getMessage());
 
     int before = entry.messages.size();
@@ -1280,21 +1503,51 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     errPayload.put("ts", System.currentTimeMillis());
     errPayload.put("message", e.getMessage());
     sessionStore.addEvent(sessionKey, "llm.error", errPayload);
+
+    if (chatRunId != null) {
+      String gid = chatRunRegistry.getAutonomousGoalId(chatRunId);
+      if (gid != null) {
+        Map<String, Object> pl = new LinkedHashMap<>();
+        pl.put("sessionKey", sessionKey);
+        pl.put("runId", chatRunId);
+        pl.put("errorPreview", trimPreview(String.valueOf(e.getMessage()), 400));
+        recordAutonomousGoalRound(gid, "round.error", pl);
+      }
+      emitChatFinal(sessionKey, chatRunId, assistantText);
+      chatRunRegistry.unregister(sessionKey, chatRunId);
+    }
   }
 
-  private void handleLlmForChatSend(String sessionKey, String lastUserMessage) throws Exception {
+  private void handleLlmForChatSend(
+      String sessionKey,
+      String lastUserMessage,
+      ChatSendLlmOptions llmOptions,
+      String chatRunId) throws Exception {
     InMemorySessionStore.SessionEntry entry = sessionStore.get(sessionKey);
-    if (entry == null) return;
+    if (entry == null) {
+      if (chatRunId != null) {
+        chatRunRegistry.unregister(sessionKey, chatRunId);
+      }
+      return;
+    }
     Object lock = LLM_SESSION_LOCKS.computeIfAbsent(sessionKey, (k) -> new Object());
     synchronized (lock) {
+      if (chatRunId != null && chatRunRegistry.isCancelled(chatRunId)) {
+        emitChatAborted(sessionKey, chatRunId);
+        chatRunRegistry.unregister(sessionKey, chatRunId);
+        return;
+      }
       LlmConfig cfg = resolveLlmConfigOrNull();
       if (cfg == null) {
         handleLlmError(
             sessionKey,
             new IllegalStateException(
-                "missing LLM config (llm.config.set or OPENCLAW_LLM_* env vars)"));
+                "missing LLM config (llm.config.set or OPENCLAW_LLM_* env vars)"),
+            chatRunId);
         return;
       }
+
+      final String autonomousGoalId = chatRunRegistry.getAutonomousGoalId(chatRunId);
 
       // Build OpenAI-compatible messages from the session transcript strings.
       // Naive role alternation: user (even index), assistant (odd index).
@@ -1363,7 +1616,19 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
         preTrace.put("systemPrompt", cfg.systemPrompt);
       }
       preTrace.put("mergedToolCount", mergedTools.size());
+      ChatSendLlmOptions opts = llmOptions != null ? llmOptions : ChatSendLlmOptions.DEFAULT;
+      if (opts.reflectionRounds() > 0) {
+        preTrace.put("reflectionRounds", opts.reflectionRounds());
+      }
       sessionStore.addEvent(sessionKey, "agent.turn.start", preTrace);
+
+      if (autonomousGoalId != null) {
+        Map<String, Object> startPl = new LinkedHashMap<>();
+        startPl.put("sessionKey", sessionKey);
+        startPl.put("runId", chatRunId);
+        startPl.put("userPreview", trimPreview(lastUserMessage, 400));
+        recordAutonomousGoalRound(autonomousGoalId, "round.start", startPl);
+      }
 
       OpenAiCompatibleChatClient client = new OpenAiCompatibleChatClient();
       AgentTurnRunner runner = new AgentTurnRunner(client, toolRegistry, 8);
@@ -1374,13 +1639,67 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
               cfg.model,
               cfg.temperature,
               cfg.maxTokens);
+      ToolExecutionContext toolCtx =
+          new ToolExecutionContext(entry.agentId, sessionKey);
+      BiConsumer<String, Map<String, Object>> eventSink =
+          (type, payload) -> sessionStore.addEvent(sessionKey, type, payload);
+      if (chatRunId != null && chatRunRegistry.isCancelled(chatRunId)) {
+        emitChatAborted(sessionKey, chatRunId);
+        chatRunRegistry.unregister(sessionKey, chatRunId);
+        return;
+      }
       String assistantText =
-          runner.run(
-              inv,
-              llmMessages,
-              toolsParam,
-              toolChoiceParam,
-              (type, payload) -> sessionStore.addEvent(sessionKey, type, payload));
+          runner.run(inv, llmMessages, toolsParam, toolChoiceParam, toolCtx, eventSink);
+
+      if (chatRunId != null && chatRunRegistry.isCancelled(chatRunId)) {
+        emitChatAborted(sessionKey, chatRunId);
+        chatRunRegistry.unregister(sessionKey, chatRunId);
+        return;
+      }
+
+      if (opts.reflectionRounds() > 0) {
+        String critiqueBase =
+            opts.reflectionPrompt() != null && !opts.reflectionPrompt().isBlank()
+                ? opts.reflectionPrompt().trim()
+                : DEFAULT_REFLECTION_PROMPT;
+        for (int r = 0; r < opts.reflectionRounds(); r++) {
+          Map<String, Object> start = new LinkedHashMap<>();
+          start.put("ts", System.currentTimeMillis());
+          start.put("round", r + 1);
+          start.put("maxRounds", opts.reflectionRounds());
+          sessionStore.addEvent(sessionKey, "agent.reflection.start", start);
+
+          StringBuilder userLine = new StringBuilder();
+          userLine.append(critiqueBase);
+          if (r > 0) {
+            userLine
+                .append("\n\n(Continue refining; follow-up round ")
+                .append(r + 1)
+                .append(".)");
+          }
+          userLine.append("\n\nOriginal user request:\n").append(lastUserMessage);
+          llmMessages.add(OpenAiCompatibleChatClient.ChatMessage.user(userLine.toString()));
+
+          assistantText = runner.run(inv, llmMessages, null, null, toolCtx, eventSink);
+
+          Map<String, Object> end = new LinkedHashMap<>();
+          end.put("ts", System.currentTimeMillis());
+          end.put("round", r + 1);
+          end.put("chars", assistantText != null ? assistantText.length() : 0);
+          sessionStore.addEvent(sessionKey, "agent.reflection.end", end);
+          if (chatRunId != null && chatRunRegistry.isCancelled(chatRunId)) {
+            emitChatAborted(sessionKey, chatRunId);
+            chatRunRegistry.unregister(sessionKey, chatRunId);
+            return;
+          }
+        }
+      }
+
+      if (chatRunId != null && chatRunRegistry.isCancelled(chatRunId)) {
+        emitChatAborted(sessionKey, chatRunId);
+        chatRunRegistry.unregister(sessionKey, chatRunId);
+        return;
+      }
 
       if (assistantText == null) assistantText = "";
       assistantText = assistantText.trim();
@@ -1395,7 +1714,590 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
 
       emitSessionsChanged(sessionKey, "llm");
       emitSessionsMessage(sessionKey, assistantSeq, assistantText);
+      if (autonomousGoalId != null) {
+        Map<String, Object> endPl = new LinkedHashMap<>();
+        endPl.put("sessionKey", sessionKey);
+        endPl.put("runId", chatRunId);
+        endPl.put("assistantPreview", trimPreview(assistantText, 400));
+        endPl.put("assistantSeq", assistantSeq);
+        recordAutonomousGoalRound(autonomousGoalId, "round.complete", endPl);
+      }
+      if (chatRunId != null) {
+        emitChatFinal(sessionKey, chatRunId, assistantText);
+        chatRunRegistry.unregister(sessionKey, chatRunId);
+      }
     }
+  }
+
+  private void handleChatHistory(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String sessionKey = optionalNonEmptyString(params, "sessionKey");
+    if (sessionKey == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "chat.history: sessionKey required"));
+      return;
+    }
+    InMemorySessionStore.SessionEntry entry = sessionStore.get(sessionKey);
+    if (entry == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "chat.history: session not found"));
+      return;
+    }
+    int limit = optionalPositiveInt(params, "limit", 200);
+    List<Map<String, Object>> messages = sessionStore.buildChatHistoryMessages(sessionKey, limit);
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("sessionKey", sessionKey);
+    payload.put("sessionId", entry.sessionId);
+    payload.put("messages", messages);
+    payload.put("thinkingLevel", entry.thinkingLevel);
+    payload.put("verboseLevel", entry.verboseLevel);
+    payload.put("fastMode", entry.fastMode);
+    sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  private void handleChatAbort(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String sessionKey = optionalNonEmptyString(params, "sessionKey");
+    if (sessionKey == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "chat.abort: sessionKey required"));
+      return;
+    }
+    String runId = optionalNonEmptyString(params, "runId");
+    int n;
+    if (runId != null) {
+      n = chatRunRegistry.cancelRun(runId) ? 1 : 0;
+    } else {
+      n = chatRunRegistry.cancelAllForSession(sessionKey);
+    }
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("ok", true);
+    payload.put("aborted", n > 0);
+    payload.put("cancelledCount", n);
+    sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  private void handleSessionsPatch(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String key = optionalNonEmptyString(params, "key");
+    if (key == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "sessions.patch: key required"));
+      return;
+    }
+    if (sessionStore.get(key) == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "sessions.patch: session not found"));
+      return;
+    }
+    sessionStore.patchSession(key, params);
+    sendResponse(session, req.getId(), true, Map.of("ok", true, "key", key), null);
+    emitSessionsChanged(key, "patch");
+  }
+
+  private void handleSessionsReset(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String key = optionalNonEmptyString(params, "key");
+    if (key == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "sessions.reset: key required"));
+      return;
+    }
+    if (sessionStore.get(key) == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "sessions.reset: session not found"));
+      return;
+    }
+    sessionStore.resetTranscript(key);
+    sendResponse(session, req.getId(), true, Map.of("ok", true, "key", key), null);
+    emitSessionsChanged(key, "reset");
+  }
+
+  private void handleSessionsCompact(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String key = optionalNonEmptyString(params, "key");
+    if (key == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "sessions.compact: key required"));
+      return;
+    }
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("ok", true);
+    payload.put("key", key);
+    payload.put("compacted", false);
+    payload.put("reason", "java_gateway: compaction not implemented (no-op)");
+    sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  private void handleConfigSet(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String raw = requireNonEmptyString(params, "raw");
+    if (raw == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "config.set: raw required"));
+      return;
+    }
+    String baseHash = optionalNonEmptyString(params, "baseHash");
+    if (baseHash != null && !baseHash.isBlank()) {
+      try {
+        ConfigSnapshot rawSnap = configLoader.loadRaw();
+        if (rawSnap.isExists() && rawSnap.getConfigPath() != null) {
+          byte[] bytes = Files.readAllBytes(Path.of(rawSnap.getConfigPath()));
+          String actual = sha256Hex(bytes);
+          if (!baseHash.equalsIgnoreCase(actual)) {
+            sendResponse(
+                session,
+                req.getId(),
+                false,
+                null,
+                ErrorShape.of(ErrorCodes.INVALID_REQUEST, "config.set: baseHash mismatch"));
+            return;
+          }
+        }
+      } catch (Exception e) {
+        sendResponse(
+            session,
+            req.getId(),
+            false,
+            null,
+            ErrorShape.of(ErrorCodes.UNAVAILABLE, "config.set: " + e.getMessage()));
+        return;
+      }
+    }
+    Map<String, Object> parsed;
+    try {
+      parsed = parseJsonObject(raw);
+    } catch (Exception e) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "config.set: invalid json: " + e.getMessage()));
+      return;
+    }
+    try {
+      configWriter.write(parsed);
+      sendResponse(
+          session,
+          req.getId(),
+          true,
+          Map.of("ok", true, "path", configWriter.getConfigPath()),
+          null);
+    } catch (Exception e) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.UNAVAILABLE, "config.set: " + e.getMessage()));
+    }
+  }
+
+  private static String sha256Hex(byte[] data) throws Exception {
+    MessageDigest md = MessageDigest.getInstance("SHA-256");
+    return HexFormat.of().formatHex(md.digest(data));
+  }
+
+  private void handleLogsTail(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    int limit = optionalPositiveInt(params, "limit", 200);
+    limit = Math.min(2000, Math.max(1, limit));
+    String envPath = System.getenv("OPENCLAW_LOG_FILE");
+    Path path = envPath != null && !envPath.isBlank() ? Path.of(envPath.trim()) : null;
+    if (path == null) {
+      try {
+        ConfigSnapshot snap = configLoader.load();
+        if (snap.getConfigPath() != null) {
+          path = Path.of(snap.getConfigPath()).getParent().resolve("gateway-java.log");
+        }
+      } catch (Exception ignored) {
+        path = null;
+      }
+    }
+    if (path == null || !Files.isRegularFile(path)) {
+      sendResponse(
+          session,
+          req.getId(),
+          true,
+          Map.of("lines", List.of(), "path", path != null ? path.toString() : ""),
+          null);
+      return;
+    }
+    try {
+      List<String> all = Files.readAllLines(path, StandardCharsets.UTF_8);
+      int start = Math.max(0, all.size() - limit);
+      sendResponse(
+          session,
+          req.getId(),
+          true,
+          Map.of("lines", all.subList(start, all.size()), "path", path.toString()),
+          null);
+    } catch (Exception e) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.UNAVAILABLE, "logs.tail: " + e.getMessage()));
+    }
+  }
+
+  private void handleLastHeartbeat(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    sendResponse(
+        session,
+        req.getId(),
+        true,
+        Map.of("ts", System.currentTimeMillis(), "ok", true),
+        null);
+  }
+
+  @SuppressWarnings("unchecked")
+  private void handleAgentIdentityGet(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    try {
+      ConfigSnapshot snap = configLoader.load();
+      Map<String, Object> cfg = (Map<String, Object>) snap.getConfig();
+      Map<String, Object> agents = cfg.get("agents") instanceof Map ? (Map<String, Object>) cfg.get("agents") : Map.of();
+      Map<String, Object> defaults =
+          agents.get("defaults") instanceof Map ? (Map<String, Object>) agents.get("defaults") : Map.of();
+      String name =
+          defaults.get("name") instanceof String s
+              ? s
+              : defaults.get("displayName") instanceof String d ? d : "OpenClaw";
+      String model = defaults.get("model") instanceof String m ? m : null;
+      Map<String, Object> payload = new LinkedHashMap<>();
+      payload.put("name", name);
+      payload.put("model", model);
+      sendResponse(session, req.getId(), true, payload, null);
+    } catch (Exception e) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.UNAVAILABLE, "agent.identity.get: " + e.getMessage()));
+    }
+  }
+
+  private void handleSystemPresence(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    sendResponse(
+        session,
+        req.getId(),
+        true,
+        Map.of("online", true, "ts", System.currentTimeMillis()),
+        null);
+  }
+
+  private void handleUsageCost(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    sendResponse(
+        session,
+        req.getId(),
+        true,
+        Map.of("cost", List.of(), "currency", "USD", "note", "java_gateway_stub"),
+        null);
+  }
+
+  private void handleSessionsUsage(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    sendResponse(
+        session,
+        req.getId(),
+        true,
+        Map.of("usage", Map.of(), "note", "java_gateway_stub"),
+        null);
+  }
+
+  private void handleSessionsUsageTimeseries(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    sendResponse(
+        session,
+        req.getId(),
+        true,
+        Map.of("points", List.of(), "note", "java_gateway_stub"),
+        null);
+  }
+
+  private void handleSessionsUsageLogs(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    sendResponse(
+        session,
+        req.getId(),
+        true,
+        Map.of("items", List.of(), "note", "java_gateway_stub"),
+        null);
+  }
+
+  private void handleExecApprovalResolve(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    sendResponse(session, req.getId(), true, Map.of("ok", true, "note", "java_gateway_noop"), null);
+  }
+
+  private void handleConfigOpenFile(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    sendResponse(
+        session,
+        req.getId(),
+        false,
+        null,
+        ErrorShape.of(
+            ErrorCodes.UNAVAILABLE,
+            "config.openFile is not supported on the Java gateway (open the file locally)"));
+  }
+
+  private void handleTtsStatus(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    sendResponse(
+        session,
+        req.getId(),
+        true,
+        Map.of("enabled", false, "provider", null, "note", "java_gateway_stub"),
+        null);
+  }
+
+  private void handleTtsProviders(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    sendResponse(session, req.getId(), true, Map.of("providers", List.of()), null);
+  }
+
+  private void handleBrowserRequest(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String sessionKey = optionalNonEmptyString(params, "sessionKey");
+    BrowserRequestOutcome out = browserProxyNodeBridge.handleRequest(params, sessionKey);
+    if (out instanceof BrowserRequestOutcome.BrowserOk ok) {
+      sendResponse(session, req.getId(), true, ok.result(), null);
+    } else if (out instanceof BrowserRequestOutcome.BrowserErr err) {
+      sendResponse(session, req.getId(), false, null, err.error());
+    } else {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.UNAVAILABLE, "browser.request: unexpected outcome"));
+    }
+  }
+
+  private void handleDevicePairList(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    sendResponse(session, req.getId(), true, Map.of("requests", List.of()), null);
+  }
+
+  private void handleDevicePairApprove(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    sendResponse(session, req.getId(), true, Map.of("ok", true, "note", "java_gateway_noop"), null);
+  }
+
+  private void handleDevicePairReject(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    sendResponse(session, req.getId(), true, Map.of("ok", true, "note", "java_gateway_noop"), null);
+  }
+
+  private void handleDeviceTokenRevoke(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    sendResponse(session, req.getId(), true, Map.of("ok", true, "note", "java_gateway_noop"), null);
+  }
+
+  private void handleAutonomousGoalsCreate(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    try {
+      sendResponse(session, req.getId(), true, autonomousGoalService.create(params), null);
+    } catch (IllegalArgumentException e) {
+      sendResponse(
+          session, req.getId(), false, null, ErrorShape.of(ErrorCodes.INVALID_REQUEST, e.getMessage()));
+    } catch (Exception e) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "autonomous.goals.create: " + e.getMessage()));
+    }
+  }
+
+  private void handleAutonomousGoalsGet(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String id = optionalNonEmptyString(params, "id");
+    if (id == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "autonomous.goals.get: id required"));
+      return;
+    }
+    Integer eventLimit = null;
+    if (params != null && params.get("eventLimit") instanceof Number n) {
+      eventLimit = n.intValue();
+    }
+    try {
+      Map<String, Object> got = autonomousGoalService.get(id, eventLimit);
+      if (got == null) {
+        sendResponse(
+            session,
+            req.getId(),
+            false,
+            null,
+            ErrorShape.of(ErrorCodes.INVALID_REQUEST, "autonomous.goals.get: goal not found"));
+        return;
+      }
+      sendResponse(session, req.getId(), true, got, null);
+    } catch (Exception e) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "autonomous.goals.get: " + e.getMessage()));
+    }
+  }
+
+  private void handleAutonomousGoalsList(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    try {
+      sendResponse(
+          session,
+          req.getId(),
+          true,
+          Map.of("goals", autonomousGoalService.listSummaries()),
+          null);
+    } catch (Exception e) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "autonomous.goals.list: " + e.getMessage()));
+    }
+  }
+
+  private void handleAutonomousGoalsPatch(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String id = optionalNonEmptyString(params, "id");
+    if (id == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "autonomous.goals.patch: id required"));
+      return;
+    }
+    Map<String, Object> patch = new LinkedHashMap<>();
+    if (params != null) {
+      patch.putAll(params);
+    }
+    patch.remove("id");
+    if (patch.isEmpty()) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "autonomous.goals.patch: no fields to patch"));
+      return;
+    }
+    try {
+      Map<String, Object> out = autonomousGoalService.patch(id, patch);
+      if (out == null) {
+        sendResponse(
+            session,
+            req.getId(),
+            false,
+            null,
+            ErrorShape.of(ErrorCodes.INVALID_REQUEST, "autonomous.goals.patch: goal not found"));
+        return;
+      }
+      String gid = id;
+      Object gObj = out.get("goal");
+      if (gObj instanceof Map<?, ?> gm && gm.get("id") instanceof String ids) {
+        gid = ids;
+      }
+      recordAutonomousGoalRound(
+          gid, "goal.patched", Map.of("patchedKeys", new ArrayList<>(patch.keySet())));
+      sendResponse(session, req.getId(), true, out, null);
+    } catch (IllegalArgumentException e) {
+      sendResponse(
+          session, req.getId(), false, null, ErrorShape.of(ErrorCodes.INVALID_REQUEST, e.getMessage()));
+    } catch (Exception e) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "autonomous.goals.patch: " + e.getMessage()));
+    }
+  }
+
+  private void handleCronList(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    sendResponse(session, req.getId(), true, gatewayCronService.listJobsRpc(params), null);
+  }
+
+  private void handleCronStatus(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    sendResponse(session, req.getId(), true, gatewayCronService.statusRpc(), null);
+  }
+
+  private void handleCronAdd(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    try {
+      sendResponse(session, req.getId(), true, gatewayCronService.addJob(params), null);
+    } catch (IllegalArgumentException e) {
+      sendResponse(
+          session, req.getId(), false, null, ErrorShape.of(ErrorCodes.INVALID_REQUEST, e.getMessage()));
+    }
+  }
+
+  private void handleCronUpdate(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    try {
+      sendResponse(session, req.getId(), true, gatewayCronService.updateJobRpc(params), null);
+    } catch (IllegalArgumentException e) {
+      sendResponse(
+          session, req.getId(), false, null, ErrorShape.of(ErrorCodes.INVALID_REQUEST, e.getMessage()));
+    }
+  }
+
+  private void handleCronRemove(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String id = optionalNonEmptyString(params, "id");
+    if (id == null) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, "cron.remove: id required"));
+      return;
+    }
+    gatewayCronService.removeJob(id);
+    sendResponse(session, req.getId(), true, Map.of("ok", true), null);
+  }
+
+  private void handleCronRun(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    try {
+      sendResponse(session, req.getId(), true, gatewayCronService.runJobRpc(params), null);
+    } catch (IllegalArgumentException e) {
+      sendResponse(
+          session, req.getId(), false, null, ErrorShape.of(ErrorCodes.INVALID_REQUEST, e.getMessage()));
+    }
+  }
+
+  private void handleCronRuns(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    sendResponse(session, req.getId(), true, gatewayCronService.listRunsRpc(params), null);
   }
 
   private void handlePoll(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
@@ -1497,8 +2399,6 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
 
     long waitTimeoutMs = timeoutMs != null && timeoutMs > 0 ? timeoutMs : 10_000;
 
-    CompletableFuture<NodeInvokeResolution> waiter = new CompletableFuture<>();
-    NODE_INVOKE_WAITERS_BY_ID.put(id, waiter);
     String sessionKey = optionalNonEmptyString(params, "sessionKey");
 
     Object rawParams = params.get("params");
@@ -1515,7 +2415,6 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       sessionKey = optionalNonEmptyString(params, "taskSessionKey");
     }
 
-    NODE_INVOKE_META_BY_ID.put(id, new PendingNodeInvokeMeta(nodeId, command, sessionKey));
     if (rawParams != null) {
       try {
         paramsJSON = MAPPER.writeValueAsString(rawParams);
@@ -1523,35 +2422,35 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
         paramsJSON = null;
       }
     }
-    enqueueNodeAction(nodeId, id, command, paramsJSON);
+
+    CompletableFuture<NodeInvokeResolution> waiter =
+        nodeInvoke.registerWaiterAndEnqueue(nodeId, id, command, paramsJSON, sessionKey);
 
     final String responseId = req.getId();
-    NODE_INVOKE_EXECUTOR.submit(
+    nodeInvoke.runCallback(
         () -> {
           try {
             NodeInvokeResolution resolution = waiter.get(waitTimeoutMs, TimeUnit.MILLISECONDS);
-            if (resolution.ok) {
+            if (resolution.ok()) {
               Map<String, Object> payload = new LinkedHashMap<>();
               payload.put("ok", true);
               payload.put("nodeId", nodeId);
               payload.put("command", command);
-              payload.put("payload", resolution.payload);
-              payload.put("payloadJSON", resolution.payloadJSON);
+              payload.put("payload", resolution.payload());
+              payload.put("payloadJSON", resolution.payloadJSON());
               sendResponse(session, responseId, true, payload, null);
             } else {
-              sendResponse(session, responseId, false, null, resolution.error);
+              sendResponse(session, responseId, false, null, resolution.error());
             }
           } catch (TimeoutException e) {
-            NODE_INVOKE_WAITERS_BY_ID.remove(id);
-            NODE_INVOKE_META_BY_ID.remove(id);
+            nodeInvoke.discardWaiter(id);
             ErrorShape err =
                 ErrorShape.of(
                     ErrorCodes.AGENT_TIMEOUT,
                     "node.invoke timeout waiting for node.invoke.result");
             sendResponse(session, responseId, false, null, err);
           } catch (Exception e) {
-            NODE_INVOKE_WAITERS_BY_ID.remove(id);
-            NODE_INVOKE_META_BY_ID.remove(id);
+            nodeInvoke.discardWaiter(id);
             ErrorShape err =
                 ErrorShape.of(
                     ErrorCodes.UNAVAILABLE, "node.invoke failed: " + e.getMessage());
@@ -1576,57 +2475,25 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       return;
     }
 
-    // Remove from pending list regardless of ok; ack will be later slice.
-    ConcurrentLinkedQueue<PendingNodeAction> q = NODE_PENDING_ACTIONS_BY_NODE_ID.get(nodeId);
-    if (q != null) {
-      q.removeIf((a) -> id.equals(a.id));
-    }
+    boolean hadWaiter =
+        nodeInvoke.completeInvokeResult(
+            id,
+            nodeId,
+            ok,
+            params.get("payload"),
+            optionalNonEmptyString(params, "payloadJSON"),
+            params.get("error"),
+            sessionStore);
 
-    CompletableFuture<NodeInvokeResolution> waiter = NODE_INVOKE_WAITERS_BY_ID.remove(id);
-    PendingNodeInvokeMeta meta = NODE_INVOKE_META_BY_ID.remove(id);
-    if (waiter == null) {
-      // Late-arriving result expected: return success and mark ignored.
+    if (!hadWaiter) {
       Map<String, Object> payload = new LinkedHashMap<>();
       payload.put("ok", true);
       payload.put("ignored", true);
       sendResponse(session, req.getId(), true, payload, null);
-
-      if (meta != null && meta.sessionKey != null) {
-        Map<String, Object> tracePayload = new LinkedHashMap<>();
-        tracePayload.put("id", id);
-        tracePayload.put("nodeId", nodeId);
-        tracePayload.put("command", meta.command);
-        tracePayload.put("ok", ok);
-        tracePayload.put("payload", params.get("payload"));
-        tracePayload.put("payloadJSON", optionalNonEmptyString(params, "payloadJSON"));
-        tracePayload.put("ts", System.currentTimeMillis());
-        sessionStore.addEvent(meta.sessionKey, "node.invoke.result", tracePayload);
-      }
       return;
     }
 
-    Object payloadObj = params.get("payload");
-    String payloadJSON = optionalNonEmptyString(params, "payloadJSON");
-    ErrorShape err = null;
-    if (!ok) {
-      err = buildErrorShapeFromNodeError(params.get("error"));
-    }
-    waiter.complete(new NodeInvokeResolution(ok, payloadObj, payloadJSON, err));
-
     sendResponse(session, req.getId(), true, Map.of("ok", true), null);
-
-    if (meta != null && meta.sessionKey != null) {
-      Map<String, Object> tracePayload = new LinkedHashMap<>();
-      tracePayload.put("id", id);
-      tracePayload.put("nodeId", nodeId);
-      tracePayload.put("command", meta.command);
-      tracePayload.put("ok", ok);
-      tracePayload.put("payload", payloadObj);
-      tracePayload.put("payloadJSON", payloadJSON);
-      tracePayload.put("error", err != null ? Map.of("code", err.getCode(), "message", err.getMessage()) : null);
-      tracePayload.put("ts", System.currentTimeMillis());
-      sessionStore.addEvent(meta.sessionKey, "node.invoke.result", tracePayload);
-    }
   }
 
   private void handleNodeEvent(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
@@ -1877,19 +2744,8 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
           ErrorShape.of(ErrorCodes.INVALID_REQUEST, "node.pending.pull: nodeId required in connect"));
       return;
     }
-    prunePendingNodeActions(nodeId, System.currentTimeMillis());
-    ConcurrentLinkedQueue<PendingNodeAction> q = NODE_PENDING_ACTIONS_BY_NODE_ID.get(nodeId);
-    List<Map<String, Object>> actions = new ArrayList<>();
-    if (q != null) {
-      for (PendingNodeAction a : q) {
-        Map<String, Object> action = new LinkedHashMap<>();
-        action.put("id", a.id);
-        action.put("command", a.command);
-        action.put("paramsJSON", a.paramsJSON);
-        action.put("enqueuedAtMs", a.enqueuedAtMs);
-        actions.add(action);
-      }
-    }
+    List<Map<String, Object>> actions =
+        nodeInvoke.snapshotPendingActions(nodeId);
     Map<String, Object> payload = new LinkedHashMap<>();
     payload.put("nodeId", nodeId);
     payload.put("actions", actions);
@@ -1909,7 +2765,7 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       return;
     }
 
-    prunePendingNodeActions(nodeId, System.currentTimeMillis());
+    nodeInvoke.prunePendingNodeActions(nodeId, System.currentTimeMillis());
     Object idsObj = params != null ? params.get("ids") : null;
     List<String> ids = new ArrayList<>();
     if (idsObj instanceof List) {
@@ -1930,76 +2786,12 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       return;
     }
 
-    ConcurrentLinkedQueue<PendingNodeAction> q = NODE_PENDING_ACTIONS_BY_NODE_ID.get(nodeId);
-    if (q != null) {
-      HashSet<String> toAck = new HashSet<>(ids);
-      q.removeIf((a) -> toAck.contains(a.id));
-    }
-    if (q != null && q.isEmpty()) {
-      NODE_PENDING_ACTIONS_BY_NODE_ID.remove(nodeId);
-    }
-    int remaining = q != null ? q.size() : 0;
+    int remaining = nodeInvoke.ackPendingActions(nodeId, ids);
     Map<String, Object> payload = new LinkedHashMap<>();
     payload.put("nodeId", nodeId);
     payload.put("ackedIds", ids);
     payload.put("remainingCount", remaining);
     sendResponse(session, req.getId(), true, payload, null);
-  }
-
-  private void prunePendingNodeActions(String nodeId, long nowMs) {
-    if (nodeId == null || nodeId.isBlank()) return;
-    ConcurrentLinkedQueue<PendingNodeAction> q = NODE_PENDING_ACTIONS_BY_NODE_ID.get(nodeId);
-    if (q == null || q.isEmpty()) return;
-
-    long minTimestampMs = nowMs - NODE_PENDING_ACTION_TTL_MS;
-    q.removeIf((a) -> a != null && a.enqueuedAtMs < minTimestampMs);
-
-    while (q.size() > NODE_PENDING_ACTION_MAX_PER_NODE) {
-      // ConcurrentLinkedQueue iterator preserves insertion order, so removing from the front
-      // approximates Node's splice(0, ... ) behavior.
-      PendingNodeAction toRemove = q.peek();
-      if (toRemove == null) break;
-      q.remove(toRemove);
-    }
-
-    if (q.isEmpty()) {
-      NODE_PENDING_ACTIONS_BY_NODE_ID.remove(nodeId);
-    }
-  }
-
-  private void enqueueNodeAction(String nodeId, String id, String command, String paramsJSON) {
-    PendingNodeAction action =
-        new PendingNodeAction(id, command, paramsJSON, System.currentTimeMillis());
-    ConcurrentLinkedQueue<PendingNodeAction> q =
-        NODE_PENDING_ACTIONS_BY_NODE_ID.computeIfAbsent(nodeId, k -> new ConcurrentLinkedQueue<>());
-    // Ensure idempotency in first slice: remove any existing action with same id.
-    q.removeIf((a) -> id.equals(a.id));
-    q.add(action);
-
-    prunePendingNodeActions(nodeId, System.currentTimeMillis());
-  }
-
-  private ErrorShape buildErrorShapeFromNodeError(Object errorObj) {
-    if (errorObj instanceof Map) {
-      @SuppressWarnings("unchecked")
-      Map<String, Object> err = (Map<String, Object>) errorObj;
-      String code = err.get("code") instanceof String s ? s : null;
-      String message = err.get("message") instanceof String s ? s : null;
-      String normalizedCode =
-          code != null
-              ? switch (code) {
-                case ErrorCodes.NOT_LINKED,
-                    ErrorCodes.NOT_PAIRED,
-                    ErrorCodes.AGENT_TIMEOUT,
-                    ErrorCodes.INVALID_REQUEST,
-                    ErrorCodes.UNAVAILABLE -> code;
-                default -> ErrorCodes.UNAVAILABLE;
-              }
-              : ErrorCodes.UNAVAILABLE;
-      String normalizedMessage = message != null ? message : "node error";
-      return ErrorShape.of(normalizedCode, normalizedMessage);
-    }
-    return ErrorShape.of(ErrorCodes.UNAVAILABLE, "node error");
   }
 
   private void handleStatus(WebSocketSession session, RequestFrame req) {
@@ -2027,6 +2819,121 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     payload.put("sessions", sessions);
 
     sendResponse(session, req.getId(), true, payload, null);
+  }
+
+  private void handleSkillsStatus(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String perr = SkillsWsParams.validateStatus(params);
+    if (perr != null) {
+      sendResponse(
+          session, req.getId(), false, null, ErrorShape.of(ErrorCodes.INVALID_REQUEST, perr));
+      return;
+    }
+    String agentId = optionalNonEmptyString(params, "agentId");
+    try {
+      Map<String, Object> report = gatewaySkillsService.skillsStatus(agentId);
+      sendResponse(session, req.getId(), true, report, null);
+    } catch (IllegalArgumentException e) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, e.getMessage()));
+    }
+  }
+
+  private void handleSkillsBins(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String perr = SkillsWsParams.validateBins(params);
+    if (perr != null) {
+      sendResponse(
+          session, req.getId(), false, null, ErrorShape.of(ErrorCodes.INVALID_REQUEST, perr));
+      return;
+    }
+    sendResponse(session, req.getId(), true, gatewaySkillsService.skillsBins(), null);
+  }
+
+  private void handleSkillsInstall(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String perr = SkillsWsParams.validateInstall(params);
+    if (perr != null) {
+      sendResponse(
+          session, req.getId(), false, null, ErrorShape.of(ErrorCodes.INVALID_REQUEST, perr));
+      return;
+    }
+    String name = optionalNonEmptyString(params, "name");
+    String installId = optionalNonEmptyString(params, "installId");
+    Long timeoutMs = null;
+    Object t = params != null ? params.get("timeoutMs") : null;
+    if (t instanceof Integer i) {
+      timeoutMs = i.longValue();
+    } else if (t instanceof Long l) {
+      timeoutMs = l;
+    }
+    try {
+      Map<String, Object> result = gatewaySkillsService.skillsInstall(name, installId, timeoutMs);
+      if (!Boolean.TRUE.equals(result.get("ok"))) {
+        sendResponse(
+            session,
+            req.getId(),
+            false,
+            null,
+            ErrorShape.of(
+                ErrorCodes.UNAVAILABLE, String.valueOf(result.getOrDefault("message", "install failed"))));
+        return;
+      }
+      sendResponse(session, req.getId(), true, result, null);
+    } catch (Exception e) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.UNAVAILABLE, e.getMessage()));
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  private void handleSkillsUpdate(
+      WebSocketSession session, RequestFrame req, Map<String, Object> params) {
+    String perr = SkillsWsParams.validateUpdate(params);
+    if (perr != null) {
+      sendResponse(
+          session, req.getId(), false, null, ErrorShape.of(ErrorCodes.INVALID_REQUEST, perr));
+      return;
+    }
+    String skillKey = optionalNonEmptyString(params, "skillKey");
+    Boolean enabled = null;
+    Object en = params.get("enabled");
+    if (en instanceof Boolean b) {
+      enabled = b;
+    }
+    String apiKey = null;
+    Object ak = params.get("apiKey");
+    if (ak instanceof String s) {
+      apiKey = s;
+    }
+    Map<String, String> envPatch = null;
+    Object env = params.get("env");
+    if (env instanceof Map<?, ?> em) {
+      envPatch = new LinkedHashMap<>();
+      for (Map.Entry<?, ?> e : em.entrySet()) {
+        if (e.getKey() instanceof String k && e.getValue() instanceof String v) {
+          envPatch.put(k, v);
+        }
+      }
+    }
+    try {
+      Map<String, Object> out = gatewaySkillsService.skillsUpdate(skillKey, enabled, apiKey, envPatch);
+      sendResponse(session, req.getId(), true, out, null);
+    } catch (IllegalArgumentException e) {
+      sendResponse(
+          session,
+          req.getId(),
+          false,
+          null,
+          ErrorShape.of(ErrorCodes.INVALID_REQUEST, e.getMessage()));
+    }
   }
 
   private void sendResponse(WebSocketSession session, String id, boolean ok, Object payload, ErrorShape error) {
@@ -2158,6 +3065,103 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     sendResponse(session, req.getId(), true, Map.of("subscribed", false, "key", key), null);
   }
 
+  private void emitChatBroadcast(Map<String, Object> payload) {
+    for (Map.Entry<String, WebSocketSession> e : ACTIVE_SESSIONS.entrySet()) {
+      WebSocketSession ws = e.getValue();
+      if (ws == null || !ws.isOpen()) {
+        continue;
+      }
+      WsContext ctx = (WsContext) ws.getAttributes().get(WsContext.KEY);
+      if (ctx == null || !ctx.connected) {
+        continue;
+      }
+      emitEvent(ws, ctx, "chat", payload);
+    }
+  }
+
+  private void emitChatFinal(String sessionKey, String runId, String assistantText) {
+    if (runId == null) {
+      return;
+    }
+    long seq = chatRunRegistry.nextChatSeq();
+    Map<String, Object> msg = new LinkedHashMap<>();
+    msg.put("role", "assistant");
+    msg.put("content", List.of(Map.of("type", "text", "text", assistantText)));
+    msg.put("timestamp", System.currentTimeMillis());
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("runId", runId);
+    payload.put("sessionKey", sessionKey);
+    payload.put("seq", seq);
+    payload.put("state", "final");
+    payload.put("message", msg);
+    emitChatBroadcast(payload);
+  }
+
+  private void emitChatAborted(String sessionKey, String runId) {
+    if (runId == null) {
+      return;
+    }
+    long seq = chatRunRegistry.nextChatSeq();
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("runId", runId);
+    payload.put("sessionKey", sessionKey);
+    payload.put("seq", seq);
+    payload.put("state", "aborted");
+    emitChatBroadcast(payload);
+    String gid = chatRunRegistry.getAutonomousGoalId(runId);
+    if (gid != null) {
+      Map<String, Object> pl = new LinkedHashMap<>();
+      pl.put("sessionKey", sessionKey);
+      pl.put("runId", runId);
+      recordAutonomousGoalRound(gid, "round.aborted", pl);
+    }
+  }
+
+  private static String trimPreview(String text, int maxChars) {
+    if (text == null) {
+      return "";
+    }
+    String t = text.trim();
+    if (t.length() <= maxChars) {
+      return t;
+    }
+    return t.substring(0, maxChars) + "…";
+  }
+
+  private void recordAutonomousGoalRound(String goalId, String type, Map<String, Object> payload) {
+    if (goalId == null || goalId.isBlank()) {
+      return;
+    }
+    try {
+      if (autonomousGoalService.appendEvent(goalId, type, payload)) {
+        emitAutonomousGoalBroadcast(goalId, type, payload);
+      }
+    } catch (Exception ignored) {
+      // Do not break chat delivery on autonomous-goal persistence failures.
+    }
+  }
+
+  private void emitAutonomousGoalBroadcast(String goalId, String type, Map<String, Object> payload) {
+    Map<String, Object> envelope = new LinkedHashMap<>();
+    envelope.put("goalId", goalId);
+    envelope.put("type", type);
+    envelope.put("ts", System.currentTimeMillis());
+    if (payload != null && !payload.isEmpty()) {
+      envelope.put("payload", payload);
+    }
+    for (Map.Entry<String, WebSocketSession> e : ACTIVE_SESSIONS.entrySet()) {
+      WebSocketSession ws = e.getValue();
+      if (ws == null || !ws.isOpen()) {
+        continue;
+      }
+      WsContext ctx = (WsContext) ws.getAttributes().get(WsContext.KEY);
+      if (ctx == null || !ctx.connected) {
+        continue;
+      }
+      emitEvent(ws, ctx, "autonomous.goal", envelope);
+    }
+  }
+
   private void emitSessionsChanged(String sessionKey, String reason) {
     for (Map.Entry<String, WsContext> e : CONTEXTS_BY_CONN_ID.entrySet()) {
       WsContext ctx = e.getValue();
@@ -2194,7 +3198,7 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
 
   private void emitEvent(WebSocketSession session, WsContext ctx, String eventName, Map<String, Object> payload) {
     if (ctx == null) return;
-    if (!EVENT_SLOTS.contains(eventName)) return;
+    if (!EMITTABLE_EVENTS.contains(eventName)) return;
     EventFrame frame = new EventFrame();
     frame.setEvent(eventName);
     frame.setPayload(payload);

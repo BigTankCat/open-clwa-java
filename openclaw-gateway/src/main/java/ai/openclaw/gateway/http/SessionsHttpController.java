@@ -1,6 +1,7 @@
 package ai.openclaw.gateway.http;
 
 import ai.openclaw.gateway.sessions.InMemorySessionStore;
+import jakarta.servlet.http.HttpServletRequest;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -19,32 +20,24 @@ import org.springframework.web.bind.annotation.RestController;
 public class SessionsHttpController {
 
   private final InMemorySessionStore sessionStore;
+  private final SessionKillService sessionKillService;
 
   @Value("${OPENCLAW_GATEWAY_TOKEN:}")
   private String gatewayToken;
 
-  public SessionsHttpController(InMemorySessionStore sessionStore) {
+  public SessionsHttpController(InMemorySessionStore sessionStore, SessionKillService sessionKillService) {
     this.sessionStore = sessionStore;
+    this.sessionKillService = sessionKillService;
   }
 
   @PostMapping("/sessions/{key}/kill")
   public ResponseEntity<Map<String, Object>> kill(
       @PathVariable("key") String key,
-      @RequestHeader(value = "Authorization", required = false) String authorization) {
-    if (!authorized(authorization)) {
-      return ResponseEntity.status(HttpStatus.FORBIDDEN)
-          .body(error("forbidden", "invalid or missing bearer token"));
-    }
-
-    if (sessionStore.get(key) == null) {
-      return ResponseEntity.status(HttpStatus.NOT_FOUND)
-          .body(notFound(key));
-    }
-    boolean deleted = sessionStore.delete(key);
-    Map<String, Object> res = new LinkedHashMap<>();
-    res.put("ok", true);
-    res.put("killed", deleted);
-    return ResponseEntity.ok(res);
+      @RequestHeader(value = "Authorization", required = false) String authorization,
+      @RequestHeader(value = SessionKillService.REQUESTER_SESSION_KEY_HEADER, required = false)
+          String requesterSessionKey,
+      HttpServletRequest request) {
+    return sessionKillService.kill(key, authorization, requesterSessionKey, request);
   }
 
   @GetMapping("/sessions/{key}/history")

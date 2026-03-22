@@ -49,6 +49,7 @@ public final class MethodScopes {
           "agents.list",
           "agent.identity.get",
           "skills.status",
+          "skills.bins",
           "voicewake.get",
           "sessions.list",
           "sessions.get",
@@ -77,7 +78,9 @@ public final class MethodScopes {
           "agents.files.get",
           "memory.search",
           "plugins.list",
-          "agent.tools.list");
+          "agent.tools.list",
+          "autonomous.goals.get",
+          "autonomous.goals.list");
 
   private static final Set<String> WRITE_METHODS =
       Set.of(
@@ -102,7 +105,9 @@ public final class MethodScopes {
           "push.test",
           "node.pending.enqueue",
           "llm.config.set",
-          "memory.put");
+          "memory.put",
+          "autonomous.goals.create",
+          "autonomous.goals.patch");
 
   private static final Set<String> ADMIN_METHODS =
       Set.of(
@@ -141,8 +146,7 @@ public final class MethodScopes {
           "node.pending.drain",
           "node.canvas.capability.refresh",
           "node.pending.pull",
-          "node.pending.ack",
-          "skills.bins");
+          "node.pending.ack");
 
   public static boolean isNodeRoleMethod(String method) {
     return NODE_ROLE_METHODS.contains(method);

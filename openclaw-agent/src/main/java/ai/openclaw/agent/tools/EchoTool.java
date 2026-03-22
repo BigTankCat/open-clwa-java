@@ -1,5 +1,6 @@
 package ai.openclaw.agent.tools;
 
+import ai.openclaw.agent.runtime.ToolExecutionContext;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.LinkedHashMap;
@@ -34,7 +35,7 @@ public final class EchoTool implements AgentTool {
   }
 
   @Override
-  public String execute(String argumentsJson) throws Exception {
+  public String execute(String argumentsJson, ToolExecutionContext ctx) throws Exception {
     if (argumentsJson == null || argumentsJson.isBlank()) {
       return "{\"error\":\"missing_arguments\"}";
     }
