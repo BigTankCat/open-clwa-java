@@ -17,6 +17,10 @@ import ai.openclaw.gateway.nodebridge.BrowserProxyNodeBridge;
 import ai.openclaw.gateway.nodebridge.BrowserProxyNodeBridge.BrowserRequestOutcome;
 import ai.openclaw.gateway.skills.GatewaySkillsService;
 import ai.openclaw.gateway.skills.SkillsWsParams;
+import ai.openclaw.gateway.business.ProjectService;
+import ai.openclaw.gateway.business.StaffService;
+import ai.openclaw.gateway.ws.ChatLlmExecutor;
+import ai.openclaw.gateway.ws.MentionDispatcher;
 import ai.openclaw.agent.runtime.AgentTraceSink;
 import ai.openclaw.agent.runtime.AgentTurnRunner;
 import ai.openclaw.agent.runtime.LlmInvocationParams;
@@ -57,6 +61,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.function.BiConsumer;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Component;
@@ -379,6 +384,28 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
   private final ChatRunRegistry chatRunRegistry;
   private final GatewayCronService gatewayCronService;
   private final AutonomousGoalService autonomousGoalService;
+  @Autowired private ProjectService projectService;
+  @Autowired private StaffService staffService;
+  private SessionContextBuilder sessionCtxBuilder;
+  private MentionDispatcher mentionDispatcher;
+  private SessionContextBuilder getCtx() {
+    if (sessionCtxBuilder == null) {
+      sessionCtxBuilder = new SessionContextBuilder(projectService, staffService);
+    }
+    return sessionCtxBuilder;
+  }
+
+  private MentionDispatcher getMentionDispatcher() {
+    if (mentionDispatcher == null) {
+      mentionDispatcher = new MentionDispatcher(
+          projectService,
+          staffService,
+          sessionStore,
+          getCtx(),
+          (k, r) -> LLM_EXECUTOR.submit(r));
+    }
+    return mentionDispatcher;
+  }
 
   public GatewayWebSocketHandler(
       ConfigLoader configLoader,
@@ -1461,6 +1488,9 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     }
     sessionStore.addEvent(sessionKey, traceEventType, tracePayload);
 
+    // Dispatch @mentions to staff sessions for project-* sessions
+    getMentionDispatcher().dispatch(sessionKey, message, messageSeq);
+
     scheduleLlmAfterUserMessage(sessionKey, message, llmOptions, chatRunId);
   }
 
@@ -1524,211 +1554,45 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       String lastUserMessage,
       ChatSendLlmOptions llmOptions,
       String chatRunId) throws Exception {
-    InMemorySessionStore.SessionEntry entry = sessionStore.get(sessionKey);
-    if (entry == null) {
-      if (chatRunId != null) {
-        chatRunRegistry.unregister(sessionKey, chatRunId);
-      }
-      return;
-    }
-    Object lock = LLM_SESSION_LOCKS.computeIfAbsent(sessionKey, (k) -> new Object());
-    synchronized (lock) {
-      if (chatRunId != null && chatRunRegistry.isCancelled(chatRunId)) {
-        emitChatAborted(sessionKey, chatRunId);
-        chatRunRegistry.unregister(sessionKey, chatRunId);
-        return;
-      }
-      LlmConfig cfg = resolveLlmConfigOrNull();
-      if (cfg == null) {
-        handleLlmError(
+    ChatLlmExecutor.ChatSendLlmOptions execOpts =
+        new ChatLlmExecutor.ChatSendLlmOptions(
+            llmOptions.reflectionRounds(),
+            llmOptions.reflectionPrompt(),
+            llmOptions.autonomousGoalId());
+    ChatLlmExecutor.LlmConfigResolver resolver = () -> {
+      LlmConfig c = resolveLlmConfigOrNull();
+      if (c == null) return null;
+      return new ChatLlmExecutor.LlmConfig(
+          c.chatCompletionsUrl,
+          c.apiKey,
+          c.model,
+          c.systemPrompt,
+          c.temperature != null ? c.temperature : 0.7,
+          c.maxTokens != null ? c.maxTokens : 4096,
+          c.tools,
+          c.toolChoice);
+    };
+    try {
+      ChatLlmExecutor.forSession(
+          sessionKey,
+          lastUserMessage,
+          execOpts,
+          chatRunId,
+          sessionStore,
+          sqlMemory,
+          toolRegistry,
+          getCtx(),
+          resolver,
+          chatRunRegistry).
+          execute();
+    } catch (Exception e) {
+      handleLlmError(
             sessionKey,
             new IllegalStateException(
                 "missing LLM config (llm.config.set or OPENCLAW_LLM_* env vars)"),
             chatRunId);
         return;
       }
-
-      final String autonomousGoalId = chatRunRegistry.getAutonomousGoalId(chatRunId);
-
-      // Build OpenAI-compatible messages from the session transcript strings.
-      // Naive role alternation: user (even index), assistant (odd index).
-      List<String> history = sessionStore.listMessages(sessionKey, 50);
-      java.util.List<OpenAiCompatibleChatClient.ChatMessage> llmMessages = new ArrayList<>();
-
-      List<MemoryHit> memoryHits = List.of();
-      try {
-        memoryHits = sqlMemory.search(entry.agentId, lastUserMessage, 16);
-      } catch (Exception ignored) {
-        memoryHits = List.of();
-      }
-      String memoryBlock = sqlMemory.formatHitsForPrompt(memoryHits, 8000);
-      StringBuilder systemText = new StringBuilder();
-      if (cfg.systemPrompt != null && !cfg.systemPrompt.isBlank()) {
-        systemText.append(cfg.systemPrompt.trim());
-      }
-      if (!memoryBlock.isBlank()) {
-        if (systemText.length() > 0) {
-          systemText.append("\n\n");
-        }
-        systemText.append("Relevant memory:\n").append(memoryBlock);
-      }
-      if (systemText.length() > 0) {
-        String sysCombined = systemText.toString();
-        llmMessages.add(OpenAiCompatibleChatClient.ChatMessage.system(sysCombined));
-      }
-
-      if (!memoryHits.isEmpty()) {
-        Map<String, Object> memTrace = new LinkedHashMap<>();
-        memTrace.put("ts", System.currentTimeMillis());
-        memTrace.put("agentId", entry.agentId);
-        memTrace.put("hitCount", memoryHits.size());
-        memTrace.put(
-            "topPaths",
-            memoryHits.stream().map(MemoryHit::path).distinct().limit(8).toList());
-        sessionStore.addEvent(sessionKey, "memory.context", memTrace);
-      }
-
-      for (int i = 0; i < history.size(); i++) {
-        String content = history.get(i);
-        String role = (i % 2 == 0) ? "user" : "assistant";
-        if ("user".equals(role)) {
-          llmMessages.add(OpenAiCompatibleChatClient.ChatMessage.user(content));
-        } else {
-          llmMessages.add(OpenAiCompatibleChatClient.ChatMessage.assistantText(content));
-        }
-      }
-
-      OpenAiToolsMerge.MergeResult merged =
-          OpenAiToolsMerge.mergeWithReport(toolRegistry.openAiTools(), cfg.tools);
-      if (!merged.overriddenNames().isEmpty()) {
-        Map<String, Object> mergeTrace = new LinkedHashMap<>();
-        mergeTrace.put("ts", System.currentTimeMillis());
-        mergeTrace.put("overriddenToolNames", merged.overriddenNames());
-        sessionStore.addEvent(sessionKey, "agent.tools.merge", mergeTrace);
-      }
-      List<Map<String, Object>> mergedTools = merged.tools();
-      Object toolsParam = mergedTools.isEmpty() ? null : mergedTools;
-      Object toolChoiceParam = toolsParam == null ? null : cfg.toolChoice;
-
-      Map<String, Object> preTrace = new LinkedHashMap<>();
-      preTrace.put("ts", System.currentTimeMillis());
-      preTrace.put("memoryHitCount", memoryHits.size());
-      if (cfg.systemPrompt != null && !cfg.systemPrompt.isBlank()) {
-        preTrace.put("systemPrompt", cfg.systemPrompt);
-      }
-      preTrace.put("mergedToolCount", mergedTools.size());
-      ChatSendLlmOptions opts = llmOptions != null ? llmOptions : ChatSendLlmOptions.DEFAULT;
-      if (opts.reflectionRounds() > 0) {
-        preTrace.put("reflectionRounds", opts.reflectionRounds());
-      }
-      sessionStore.addEvent(sessionKey, "agent.turn.start", preTrace);
-
-      if (autonomousGoalId != null) {
-        Map<String, Object> startPl = new LinkedHashMap<>();
-        startPl.put("sessionKey", sessionKey);
-        startPl.put("runId", chatRunId);
-        startPl.put("userPreview", trimPreview(lastUserMessage, 400));
-        recordAutonomousGoalRound(autonomousGoalId, "round.start", startPl);
-      }
-
-      OpenAiCompatibleChatClient client = new OpenAiCompatibleChatClient();
-      AgentTurnRunner runner = new AgentTurnRunner(client, toolRegistry, 8);
-      LlmInvocationParams inv =
-          new LlmInvocationParams(
-              cfg.chatCompletionsUrl,
-              cfg.apiKey,
-              cfg.model,
-              cfg.temperature,
-              cfg.maxTokens);
-      ToolExecutionContext toolCtx =
-          new ToolExecutionContext(entry.agentId, sessionKey);
-      BiConsumer<String, Map<String, Object>> rawSink =
-          (type, payload) -> sessionStore.addEvent(sessionKey, type, payload);
-      AgentTraceSink eventSink = rawSink::accept;
-      if (chatRunId != null && chatRunRegistry.isCancelled(chatRunId)) {
-        emitChatAborted(sessionKey, chatRunId);
-        chatRunRegistry.unregister(sessionKey, chatRunId);
-        return;
-      }
-      String assistantText =
-          runner.run(inv, llmMessages, toolsParam, toolChoiceParam, toolCtx, eventSink);
-
-      if (chatRunId != null && chatRunRegistry.isCancelled(chatRunId)) {
-        emitChatAborted(sessionKey, chatRunId);
-        chatRunRegistry.unregister(sessionKey, chatRunId);
-        return;
-      }
-
-      if (opts.reflectionRounds() > 0) {
-        String critiqueBase =
-            opts.reflectionPrompt() != null && !opts.reflectionPrompt().isBlank()
-                ? opts.reflectionPrompt().trim()
-                : DEFAULT_REFLECTION_PROMPT;
-        for (int r = 0; r < opts.reflectionRounds(); r++) {
-          Map<String, Object> start = new LinkedHashMap<>();
-          start.put("ts", System.currentTimeMillis());
-          start.put("round", r + 1);
-          start.put("maxRounds", opts.reflectionRounds());
-          sessionStore.addEvent(sessionKey, "agent.reflection.start", start);
-
-          StringBuilder userLine = new StringBuilder();
-          userLine.append(critiqueBase);
-          if (r > 0) {
-            userLine
-                .append("\n\n(Continue refining; follow-up round ")
-                .append(r + 1)
-                .append(".)");
-          }
-          userLine.append("\n\nOriginal user request:\n").append(lastUserMessage);
-          llmMessages.add(OpenAiCompatibleChatClient.ChatMessage.user(userLine.toString()));
-
-          assistantText = runner.run(inv, llmMessages, null, null, toolCtx, eventSink);
-
-          Map<String, Object> end = new LinkedHashMap<>();
-          end.put("ts", System.currentTimeMillis());
-          end.put("round", r + 1);
-          end.put("chars", assistantText != null ? assistantText.length() : 0);
-          sessionStore.addEvent(sessionKey, "agent.reflection.end", end);
-          if (chatRunId != null && chatRunRegistry.isCancelled(chatRunId)) {
-            emitChatAborted(sessionKey, chatRunId);
-            chatRunRegistry.unregister(sessionKey, chatRunId);
-            return;
-          }
-        }
-      }
-
-      if (chatRunId != null && chatRunRegistry.isCancelled(chatRunId)) {
-        emitChatAborted(sessionKey, chatRunId);
-        chatRunRegistry.unregister(sessionKey, chatRunId);
-        return;
-      }
-
-      if (assistantText == null) assistantText = "";
-      assistantText = assistantText.trim();
-      if (assistantText.isBlank()) {
-        assistantText = "NO_REPLY";
-      }
-
-      int before = entry.messages.size();
-      sessionStore.addMessage(sessionKey, assistantText);
-      int after = entry.messages.size();
-      int assistantSeq = after > before ? before + 1 : after;
-
-      emitSessionsChanged(sessionKey, "llm");
-      emitSessionsMessage(sessionKey, assistantSeq, assistantText);
-      if (autonomousGoalId != null) {
-        Map<String, Object> endPl = new LinkedHashMap<>();
-        endPl.put("sessionKey", sessionKey);
-        endPl.put("runId", chatRunId);
-        endPl.put("assistantPreview", trimPreview(assistantText, 400));
-        endPl.put("assistantSeq", assistantSeq);
-        recordAutonomousGoalRound(autonomousGoalId, "round.complete", endPl);
-      }
-      if (chatRunId != null) {
-        emitChatFinal(sessionKey, chatRunId, assistantText);
-        chatRunRegistry.unregister(sessionKey, chatRunId);
-      }
-    }
   }
 
   private void handleChatHistory(WebSocketSession session, RequestFrame req, Map<String, Object> params) {

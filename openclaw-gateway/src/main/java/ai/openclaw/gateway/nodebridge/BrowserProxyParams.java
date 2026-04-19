@@ -32,7 +32,7 @@ public final class BrowserProxyParams {
   public static ParseResult parse(Map<String, Object> params) {
     String methodRaw =
         params.get("method") instanceof String s ? s.trim().toUpperCase() : "";
-    String path = params.get("path") instanceof String s ? s.trim() : "";
+    String path = normalizeBrowserRequestPath(params.get("path") instanceof String s ? s.trim() : "");
     if (methodRaw.isEmpty() || path.isEmpty()) {
       return new ParseError(
           ErrorShape.of(ErrorCodes.INVALID_REQUEST, "method and path are required"));
@@ -121,7 +121,7 @@ public final class BrowserProxyParams {
   public static Map<String, Object> toProxyCommandParams(Parsed p) {
     Map<String, Object> proxy = new LinkedHashMap<>();
     proxy.put("method", p.method());
-    proxy.put("path", p.path());
+    proxy.put("path", normalizeBrowserRequestPath(p.path()));
     if (p.query() != null && !p.query().isEmpty()) {
       proxy.put("query", p.query());
     }

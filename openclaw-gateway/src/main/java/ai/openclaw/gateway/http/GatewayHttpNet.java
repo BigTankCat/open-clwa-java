@@ -92,12 +92,10 @@ public final class GatewayHttpNet {
         return host.substring(1, end);
       }
     }
+    // Strip port from any host:port form (mirrors TypeScript resolveHostName)
     int colon = host.lastIndexOf(':');
     if (colon > 0 && !host.startsWith("[") && host.indexOf(':') == colon) {
-      String maybeIp = host.substring(0, colon);
-      if (isProbablyIpv4(maybeIp)) {
-        return maybeIp;
-      }
+      return host.substring(0, colon);
     }
     return host;
   }
