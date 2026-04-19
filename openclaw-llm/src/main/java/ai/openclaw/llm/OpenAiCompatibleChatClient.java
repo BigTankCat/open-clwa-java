@@ -69,7 +69,7 @@ public final class OpenAiCompatibleChatClient {
         HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
   }
 
-  static Map<String, Object> messageToRequestMap(ChatMessage m) {
+  public static Map<String, Object> messageToRequestMap(ChatMessage m) {
     Map<String, Object> map = new LinkedHashMap<>();
     map.put("role", m.role());
     boolean hasToolCalls =

@@ -17,10 +17,16 @@
     <dependency>
       <groupId>com.fasterxml.jackson.core</groupId>
       <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
     </dependency>
     <dependency>
-      <groupId>com.fasterxml.jackson.dataformat</groupId>
-      <artifactId>jackson-dataformat-json5</artifactId>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-core</artifactId>
+      <version>${jackson.version}</version>
     </dependency>
+    <!-- jackson-dataformat-json5 is not published to Maven Central.
+         We use jackson-databind + ALLOW_TRAILING_COMMA instead, since the
+         OpenClaw config JSON only has trailing commas as non-standard JSON.
+         If single-quote strings or unquoted keys appear later, add json5 back. -->
   </dependencies>
 </project>

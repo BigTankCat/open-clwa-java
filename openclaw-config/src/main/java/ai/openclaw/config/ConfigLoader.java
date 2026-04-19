@@ -1,8 +1,9 @@
 package ai.openclaw.config;
 
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.json.JsonReadFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.dataformat.json5.Json5Factory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
@@ -15,7 +16,11 @@ import java.util.Map;
  */
 public final class ConfigLoader {
 
-  private static final ObjectMapper MAPPER = new ObjectMapper(new Json5Factory());
+  private static final ObjectMapper MAPPER = new ObjectMapper(
+      JsonFactory.builder()
+          .enable(JsonReadFeature.ALLOW_TRAILING_COMMA)
+          .build()
+  );
 
   private final ConfigPaths paths;
 

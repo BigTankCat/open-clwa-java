@@ -5,6 +5,37 @@ import com.fasterxml.jackson.annotation.JsonTypeName;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import java.util.Map;
 
+/**
+ * WebSocket JSON-RPC request frame sent from client to server.
+ * <p>
+ * This frame represents a single request message in the JSON-RPC protocol,
+ * containing a unique identifier, method name to invoke, and parameters.
+ * Each request expects a corresponding {@link ResponseFrame} with matching id.
+ *
+ * <p>Example JSON structure:
+ * <pre>{@code
+ * {
+ *   "type": "req",
+ *   "id": "550e8400-e29b-41d4-a716-446655440000",
+ *   "method": "chat.send",
+ *   "params": {
+ *     "sessionKey": "daily",
+ *     "message": "Hello"
+ *   }
+ * }
+ * }</pre>
+ *
+ * @param type      Frame type, always "req" for requests
+ * @param id        Unique request identifier (UUID), used to match responses
+ * @param method    Method name to invoke, e.g., "chat.send", "config.get"
+ * @param params    Method-specific parameters as key-value map
+ *
+ * @author OpenClaw Team
+ * @since 2026.3.14
+ * @see ResponseFrame
+ * @see EventFrame
+ * @see GatewayFrame
+ */
 @JsonTypeName("req")
 @JsonIgnoreProperties(ignoreUnknown = true)
 public final class RequestFrame implements GatewayFrame {

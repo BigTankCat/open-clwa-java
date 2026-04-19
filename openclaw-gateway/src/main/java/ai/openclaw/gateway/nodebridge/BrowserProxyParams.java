@@ -13,33 +13,36 @@ public final class BrowserProxyParams {
 
   private BrowserProxyParams() {}
 
-  public sealed interface ParseResult permits Parsed, ParseError {
-    record Parsed(
-        String method,
-        String path,
-        Map<String, Object> query,
-        Object body,
-        Long timeoutMs,
-        String profile)
-        implements ParseResult {}
+  // Records must be declared before the sealed interface that permits them.
+  public record Parsed(
+      String method,
+      String path,
+      Map<String, Object> query,
+      Object body,
+      Long timeoutMs,
+      String profile)
+      implements ParseResult {}
 
-    record ParseError(ErrorShape error) implements ParseResult {}
-  }
+  public record ParseError(ErrorShape error) implements ParseResult {}
+
+  public sealed interface ParseResult permits Parsed, ParseError {}
+
+
 
   public static ParseResult parse(Map<String, Object> params) {
     String methodRaw =
         params.get("method") instanceof String s ? s.trim().toUpperCase() : "";
     String path = params.get("path") instanceof String s ? s.trim() : "";
     if (methodRaw.isEmpty() || path.isEmpty()) {
-      return new ParseResult.ParseError(
+      return new ParseError(
           ErrorShape.of(ErrorCodes.INVALID_REQUEST, "method and path are required"));
     }
     if (!methodRaw.equals("GET") && !methodRaw.equals("POST") && !methodRaw.equals("DELETE")) {
-      return new ParseResult.ParseError(
+      return new ParseError(
           ErrorShape.of(ErrorCodes.INVALID_REQUEST, "method must be GET, POST, or DELETE"));
     }
     if (isPersistentBrowserProfileMutation(methodRaw, path)) {
-      return new ParseResult.ParseError(
+      return new ParseError(
           ErrorShape.of(
               ErrorCodes.INVALID_REQUEST,
               "browser.request cannot create or delete persistent browser profiles"));
@@ -66,7 +69,7 @@ public final class BrowserProxyParams {
     }
 
     String profile = resolveRequestedProfile(query, body);
-    return new ParseResult.Parsed(methodRaw, path, query, body, timeoutMs, profile);
+    return new Parsed(methodRaw, path, query, body, timeoutMs, profile);
   }
 
   static String normalizeBrowserRequestPath(String value) {
@@ -115,7 +118,7 @@ public final class BrowserProxyParams {
   }
 
   /** Builds the JSON object passed as {@code browser.proxy} params on the Node side. */
-  public static Map<String, Object> toProxyCommandParams(ParseResult.Parsed p) {
+  public static Map<String, Object> toProxyCommandParams(Parsed p) {
     Map<String, Object> proxy = new LinkedHashMap<>();
     proxy.put("method", p.method());
     proxy.put("path", p.path());

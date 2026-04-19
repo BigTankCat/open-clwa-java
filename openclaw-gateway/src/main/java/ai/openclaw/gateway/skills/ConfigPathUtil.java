@@ -49,14 +49,14 @@ public final class ConfigPathUtil {
 
   public static boolean isConfigPathTruthy(Object configRoot, String pathStr) {
     Object v = resolvePath(configRoot, pathStr);
-    if (v == undefinedLike(v) && DEFAULT_TRUTHY.containsKey(pathStr)) {
+    if (v == null && DEFAULT_TRUTHY.containsKey(pathStr)) {
       return Boolean.TRUE.equals(DEFAULT_TRUTHY.get(pathStr));
     }
     return isTruthy(v);
   }
 
-  private static boolean undefinedLike(Object v) {
-    return v == null;
+  private static Object undefinedLike(Object v) {
+    return v == null ? null : v;
   }
 
   public static String normalizeString(Object v) {

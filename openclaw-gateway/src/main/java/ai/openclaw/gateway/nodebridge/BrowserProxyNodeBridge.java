@@ -58,15 +58,15 @@ public final class BrowserProxyNodeBridge {
     return browserNodeId.isEmpty() ? null : browserNodeId;
   }
 
-  public sealed interface BrowserRequestOutcome permits BrowserOk, BrowserErr {
-    record BrowserOk(Object result) implements BrowserRequestOutcome {}
+  public record BrowserOk(Object result) implements BrowserRequestOutcome {}
 
-    record BrowserErr(ErrorShape error) implements BrowserRequestOutcome {}
-  }
+  public record BrowserErr(ErrorShape error) implements BrowserRequestOutcome {}
+
+  public sealed interface BrowserRequestOutcome permits BrowserOk, BrowserErr {}
 
   public BrowserRequestOutcome handleRequest(Map<String, Object> params, String sessionKey) {
     if (!isEnabled()) {
-      return new BrowserRequestOutcome.BrowserErr(
+      return new BrowserErr(
           ErrorShape.of(
               ErrorCodes.UNAVAILABLE,
               "browser.request: set OPENCLAW_BRIDGE_BROWSER_NODE_ID (or openclaw.bridge.browser-node-id) "
@@ -74,11 +74,11 @@ public final class BrowserProxyNodeBridge {
     }
 
     var parsed = BrowserProxyParams.parse(params);
-    if (parsed instanceof BrowserProxyParams.ParseResult.ParseError e) {
-      return new BrowserRequestOutcome.BrowserErr(e.error());
+    if (parsed instanceof BrowserProxyParams.ParseError e) {
+      return new BrowserErr(e.error());
     }
-    if (!(parsed instanceof BrowserProxyParams.ParseResult.Parsed ok)) {
-      return new BrowserRequestOutcome.BrowserErr(
+    if (!(parsed instanceof BrowserProxyParams.Parsed ok)) {
+      return new BrowserErr(
           ErrorShape.of(ErrorCodes.UNAVAILABLE, "browser.request: invalid params"));
     }
 
@@ -91,7 +91,7 @@ public final class BrowserProxyNodeBridge {
     try {
       paramsJson = mapper.writeValueAsString(proxyParams);
     } catch (Exception ex) {
-      return new BrowserRequestOutcome.BrowserErr(
+      return new BrowserErr(
           ErrorShape.of(ErrorCodes.INVALID_REQUEST, "browser.request: cannot serialize params"));
     }
 
@@ -101,7 +101,7 @@ public final class BrowserProxyNodeBridge {
     try {
       NodeInvokeResolution res = waiter.get(waitMs, TimeUnit.MILLISECONDS);
       if (!res.ok()) {
-        return new BrowserRequestOutcome.BrowserErr(
+        return new BrowserErr(
             res.error() != null
                 ? res.error()
                 : ErrorShape.of(ErrorCodes.UNAVAILABLE, "browser.proxy failed"));
@@ -112,34 +112,34 @@ public final class BrowserProxyNodeBridge {
           payloadObj =
               mapper.readValue(res.payloadJSON(), new TypeReference<Map<String, Object>>() {});
         } catch (Exception ex) {
-          return new BrowserRequestOutcome.BrowserErr(
+          return new BrowserErr(
               ErrorShape.of(ErrorCodes.UNAVAILABLE, "browser.proxy: invalid payload JSON"));
         }
       }
       if (!(payloadObj instanceof Map<?, ?> m)) {
-        return new BrowserRequestOutcome.BrowserErr(
+        return new BrowserErr(
             ErrorShape.of(ErrorCodes.UNAVAILABLE, "browser.proxy: missing result object"));
       }
       Object inner = m.get("result");
       if (inner == null) {
-        return new BrowserRequestOutcome.BrowserErr(
+        return new BrowserErr(
             ErrorShape.of(ErrorCodes.UNAVAILABLE, "browser proxy failed"));
       }
-      return new BrowserRequestOutcome.BrowserOk(inner);
+      return new BrowserOk(inner);
     } catch (TimeoutException e) {
       nodeInvoke.discardWaiter(id);
-      return new BrowserRequestOutcome.BrowserErr(
+      return new BrowserErr(
           ErrorShape.of(ErrorCodes.AGENT_TIMEOUT, "browser.request: timeout waiting for node"));
     } catch (ExecutionException e) {
       nodeInvoke.discardWaiter(id);
       Throwable c = e.getCause();
       String msg = c != null ? c.getMessage() : e.getMessage();
-      return new BrowserRequestOutcome.BrowserErr(
+      return new BrowserErr(
           ErrorShape.of(ErrorCodes.UNAVAILABLE, "browser.request failed: " + msg));
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       nodeInvoke.discardWaiter(id);
-      return new BrowserRequestOutcome.BrowserErr(ErrorShape.of(ErrorCodes.UNAVAILABLE, "interrupted"));
+      return new BrowserErr(ErrorShape.of(ErrorCodes.UNAVAILABLE, "interrupted"));
     }
   }
 }

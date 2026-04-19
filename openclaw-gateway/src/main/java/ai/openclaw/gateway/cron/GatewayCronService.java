@@ -225,7 +225,8 @@ public final class GatewayCronService {
     job.put(
         "nextRunAtMs",
         computeNextRun(schedule, ZonedDateTime.now(ZONE)));
-    jobs.removeIf(j -> id.equals(stringVal(j.get("id"))));
+    final String removeId = id;
+    jobs.removeIf(j -> removeId.equals(stringVal(j.get("id"))));
     jobs.add(job);
     save();
     Map<String, Object> res = new LinkedHashMap<>();

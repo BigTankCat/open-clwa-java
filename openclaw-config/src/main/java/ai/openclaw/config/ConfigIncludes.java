@@ -137,7 +137,7 @@ public final class ConfigIncludes {
     }
 
     if (includeValue instanceof String s) {
-      return loadIncludeFile(s, currentFile, rootDir, chain, depth);
+      return loadIncludeFile(s, currentFile, rootDir, includeStack, depth);
     }
 
     if (includeValue instanceof List<?> list) {
@@ -147,7 +147,7 @@ public final class ConfigIncludes {
           throw new ConfigIncludeException(
               "Invalid $include array item: expected string");
         }
-        Object part = loadIncludeFile(str, currentFile, rootDir, chain, depth);
+        Object part = loadIncludeFile(str, currentFile, rootDir, includeStack, depth);
         if (merged == null) {
           merged = part;
         } else {
@@ -164,7 +164,7 @@ public final class ConfigIncludes {
       String includePath,
       Path currentFile,
       Path rootDir,
-      LinkedList<Path> chain,
+      LinkedList<Path> includeStack,
       int depth) {
     Path configDir = currentFile.getParent();
     if (configDir == null) configDir = rootDir;
@@ -197,9 +197,13 @@ public final class ConfigIncludes {
     if (Files.notExists(resolvedReal)) {
       throw new ConfigIncludeException("Failed to read include file: " + includePath);
     }
-    if (Files.size(resolvedReal) > MAX_INCLUDE_FILE_BYTES) {
-      throw new ConfigIncludeException(
-          "Include file exceeds max bytes: " + includePath + " (max " + MAX_INCLUDE_FILE_BYTES + ")");
+    try {
+      if (Files.size(resolvedReal) > MAX_INCLUDE_FILE_BYTES) {
+        throw new ConfigIncludeException(
+            "Include file exceeds max bytes: " + includePath + " (max " + MAX_INCLUDE_FILE_BYTES + ")");
+      }
+    } catch (IOException e) {
+      throw new ConfigIncludeException("Failed to read include file: " + includePath, e);
     }
 
     includeStack.add(resolvedReal);

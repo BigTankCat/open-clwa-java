@@ -17,6 +17,7 @@ import ai.openclaw.gateway.nodebridge.BrowserProxyNodeBridge;
 import ai.openclaw.gateway.nodebridge.BrowserProxyNodeBridge.BrowserRequestOutcome;
 import ai.openclaw.gateway.skills.GatewaySkillsService;
 import ai.openclaw.gateway.skills.SkillsWsParams;
+import ai.openclaw.agent.runtime.AgentTraceSink;
 import ai.openclaw.agent.runtime.AgentTurnRunner;
 import ai.openclaw.agent.runtime.LlmInvocationParams;
 import ai.openclaw.agent.runtime.OpenAiToolsMerge;
@@ -946,7 +947,7 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
     Map<String, Object> payload = new LinkedHashMap<>();
     payload.put("ok", true);
     payload.put("path", configWriter.getConfigPath());
-    payload.put("config", merged);
+    payload.put("config", mergedResolved);
     payload.put("restart", restart);
     payload.put("sentinel", sentinel);
     sendResponse(session, req.getId(), true, payload, null);
@@ -1641,8 +1642,9 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
               cfg.maxTokens);
       ToolExecutionContext toolCtx =
           new ToolExecutionContext(entry.agentId, sessionKey);
-      BiConsumer<String, Map<String, Object>> eventSink =
+      BiConsumer<String, Map<String, Object>> rawSink =
           (type, payload) -> sessionStore.addEvent(sessionKey, type, payload);
+      AgentTraceSink eventSink = rawSink::accept;
       if (chatRunId != null && chatRunRegistry.isCancelled(chatRunId)) {
         emitChatAborted(sessionKey, chatRunId);
         chatRunRegistry.unregister(sessionKey, chatRunId);
@@ -2084,9 +2086,9 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
   private void handleBrowserRequest(WebSocketSession session, RequestFrame req, Map<String, Object> params) {
     String sessionKey = optionalNonEmptyString(params, "sessionKey");
     BrowserRequestOutcome out = browserProxyNodeBridge.handleRequest(params, sessionKey);
-    if (out instanceof BrowserRequestOutcome.BrowserOk ok) {
+    if (out instanceof BrowserProxyNodeBridge.BrowserOk ok) {
       sendResponse(session, req.getId(), true, ok.result(), null);
-    } else if (out instanceof BrowserRequestOutcome.BrowserErr err) {
+    } else if (out instanceof BrowserProxyNodeBridge.BrowserErr err) {
       sendResponse(session, req.getId(), false, null, err.error());
     } else {
       sendResponse(
@@ -2694,7 +2696,7 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
 
     Long expiresAtMs = null;
     if (expiresInMs != null) {
-      expiresAtMs = now + Math.max(1_000, Math.trunc(expiresInMs));
+      expiresAtMs = now + Math.max(1_000L, (long) Math.floor(expiresInMs.doubleValue()));
     }
 
     PendingNodeDrainWorkState state = getOrCreateNodeDrainState(nodeId);
@@ -3016,7 +3018,8 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
       return i > 0 ? i : defaultValue;
     }
     if (v instanceof Long l) {
-      return l > 0 && l <= Integer.MAX_VALUE ? (int) l : defaultValue;
+      long lv = l;
+      return lv > 0 && lv <= Integer.MAX_VALUE ? (int) lv : defaultValue;
     }
     return defaultValue;
   }

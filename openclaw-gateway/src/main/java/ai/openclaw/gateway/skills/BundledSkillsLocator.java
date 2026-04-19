@@ -59,20 +59,24 @@ public final class BundledSkillsLocator {
       return false;
     }
     try (var stream = Files.list(dir)) {
-      return stream.anyMatch(
-          p -> {
-            try {
-              if (Files.isRegularFile(p) && p.getFileName().toString().toLowerCase().endsWith(".md")) {
-                return true;
-              }
-              return Files.isDirectory(p)
-                  && Files.isRegularFile(p.resolve("SKILL.md"));
-            } catch (IOException e) {
-              return false;
-            }
-          });
+      return stream.anyMatch(p -> isSkillEntry(p));
     } catch (IOException e) {
       return false;
     }
+  }
+
+  private static boolean isSkillEntry(Path p) {
+    try {
+      return isSkillEntryUnsafe(p);
+    } catch (IOException e) {
+      return false;
+    }
+  }
+
+  private static boolean isSkillEntryUnsafe(Path p) throws IOException {
+    if (Files.isRegularFile(p) && p.getFileName().toString().toLowerCase().endsWith(".md")) {
+      return true;
+    }
+    return Files.isDirectory(p) && Files.isRegularFile(p.resolve("SKILL.md"));
   }
 }
