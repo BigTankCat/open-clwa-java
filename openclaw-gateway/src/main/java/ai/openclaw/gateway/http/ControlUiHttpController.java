@@ -114,8 +114,7 @@ public class ControlUiHttpController {
 
       return ResponseEntity.ok()
           .contentType(mediaType)
-          .cacheControl(org.springframework.http.HttpHeaders.createCacheControl(
-              org.springframework.http.CacheControl.maxAge(3600)))
+          .cacheControl(org.springframework.http.CacheControl.maxAge(java.time.Duration.ofSeconds(3600)))
           .header("X-Content-Type-Options", "nosniff")
           .header("X-Frame-Options", "DENY")
           .body(content);
@@ -192,8 +191,8 @@ public class ControlUiHttpController {
 
   private MediaType contentTypeForFile(String filename) {
     if (filename.endsWith(".html")) return MediaType.TEXT_HTML;
-    if (filename.endsWith(".js")) return MediaType.APPLICATION_JAVASCRIPT;
-    if (filename.endsWith(".css")) return MediaType.TEXT_CSS;
+    if (filename.endsWith(".js")) return MediaType.valueOf("application/javascript");
+    if (filename.endsWith(".css")) return MediaType.valueOf("text/css");
     if (filename.endsWith(".json")) return MediaType.APPLICATION_JSON;
     if (filename.endsWith(".svg")) return MediaType.valueOf("image/svg+xml");
     if (filename.endsWith(".png")) return MediaType.IMAGE_PNG;
