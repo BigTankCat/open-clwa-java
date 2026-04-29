@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenClaw Control UI</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f1117;
+      color: #e6edf3;
+      min-height: 100vh;
+    }
+    .navbar {
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      padding: 0 20px;
+      height: 56px;
+      display: flex;
+      align-items: center;
+      gap: 24px;
+    }
+    .navbar-brand {
+      font-size: 18px;
+      font-weight: 700;
+      color: #58a6ff;
+      text-decoration: none;
+    }
+    .navbar-brand:hover { color: #79b8ff; }
+    .nav-links { display: flex; gap: 4px; }
+    .nav-link {
+      padding: 8px 12px;
+      border-radius: 6px;
+      color: #8b949e;
+      text-decoration: none;
+      font-size: 14px;
+      transition: background 0.15s, color 0.15s;
+    }
+    .nav-link:hover, .nav-link.active {
+      background: #21262d;
+      color: #e6edf3;
+    }
+    .main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+    .card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    .card-title {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 16px;
+      color: #e6edf3;
+    }
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 12px;
+    }
+    .status-item {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 14px;
+    }
+    .status-label {
+      font-size: 12px;
+      color: #8b949e;
+      margin-bottom: 4px;
+    }
+    .status-value {
+      font-size: 20px;
+      font-weight: 600;
+      color: #e6edf3;
+    }
+    .status-value.ok { color: #3fb950; }
+    .status-value.warn { color: #d29922; }
+    .status-value.error { color: #f85149; }
+    .btn {
+      padding: 8px 16px;
+      border-radius: 6px;
+      border: 1px solid #30363d;
+      background: #21262d;
+      color: #e6edf3;
+      font-size: 14px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn:hover { background: #30363d; }
+    .btn.primary {
+      background: #238636;
+      border-color: #238636;
+    }
+    .btn.primary:hover { background: #2ea043; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid #30363d;
+      font-size: 14px;
+    }
+    th { color: #8b949e; font-weight: 500; }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .badge.green { background: #21262d; color: #3fb950; }
+    .badge.yellow { background: #21262d; color: #d29922; }
+    .badge.red { background: #21262d; color: #f85149; }
+    .section { display: none; }
+    .section.active { display: block; }
+    .logs {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 12px;
+      font-family: ui-monospace, monospace;
+      font-size: 12px;
+      max-height: 300px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      color: #8b949e;
+    }
+    .ws-status {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 6px;
+    }
+    .ws-status.connected { background: #3fb950; }
+    .ws-status.disconnected { background: #f85149; }
+    .input-group { margin-bottom: 12px; }
+    .input-group label {
+      display: block;
+      font-size: 13px;
+      color: #8b949e;
+      margin-bottom: 4px;
+    }
+    .input-group input, .input-group textarea {
+      width: 100%;
+      padding: 8px 12px;
+      border-radius: 6px;
+      border: 1px solid #30363d;
+      background: #0d1117;
+      color: #e6edf3;
+      font-size: 14px;
+    }
+    .input-group textarea { min-height: 80px; font-family: monospace; }
+  </style>
+</head>
+<body>
+  <nav class="navbar">
+    <a class="navbar-brand" href="#/">OpenClaw</a>
+    <div class="nav-links">
+      <a class="nav-link active" data-section="status" href="#/status">Status</a>
+      <a class="nav-link" data-section="sessions" href="#/sessions">Sessions</a>
+      <a class="nav-link" data-section="config" href="#/config">Config</a>
+      <a class="nav-link" data-section="skills" href="#/skills">Skills</a>
+      <a class="nav-link" data-section="tools" href="#/tools">Tools</a>
+    </div>
+  </nav>
+
+  <div class="main">
+    <!-- Status Section -->
+    <div class="section active" id="section-status">
+      <div class="card">
+        <div class="card-title">Gateway Status</div>
+        <div class="status-grid">
+          <div class="status-item">
+            <div class="status-label">Version</div>
+            <div class="status-value" id="version">—</div>
+          </div>
+          <div class="status-item">
+            <div class="status-label">WebSocket</div>
+            <div class="status-value" id="ws-status"><span class="ws-status disconnected"></span>Disconnected</div>
+          </div>
+          <div class="status-item">
+            <div class="status-label">Sessions</div>
+            <div class="status-value" id="session-count">0</div>
+          </div>
+          <div class="status-item">
+            <div class="status-label">Uptime</div>
+            <div class="status-value" id="uptime">—</div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Assistant Identity</div>
+        <div class="status-grid">
+          <div class="status-item">
+            <div class="status-label">Name</div>
+            <div class="status-value" id="assistant-name">—</div>
+          </div>
+          <div class="status-item">
+            <div class="status-label">Agent ID</div>
+            <div class="status-value" id="agent-id">—</div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">System</div>
+        <div class="status-grid">
+          <div class="status-item">
+            <div class="status-label">Memory</div>
+            <div class="status-value" id="memory-status">—</div>
+          </div>
+          <div class="status-item">
+            <div class="status-label">LLM Provider</div>
+            <div class="status-value" id="llm-provider">—</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Sessions Section -->
+    <div class="section" id="section-sessions">
+      <div class="card">
+        <div class="card-title">Active Sessions</div>
+        <table>
+          <thead>
+            <tr>
+              <th>Session Key</th>
+              <th>Type</th>
+              <th>Messages</th>
+              <th>Created</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="sessions-table-body">
+            <tr><td colspan="5" style="color:#8b949e;text-align:center">No active sessions</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="card-title">Session Trace</div>
+        <div class="input-group">
+          <label>Session Key</label>
+          <input id="trace-session-key" type="text" placeholder="e.g. project-123@sid-abc" />
+        </div>
+        <button class="btn" onclick="loadTrace()">Load Trace</button>
+        <div id="trace-output" class="logs" style="margin-top:12px;display:none"></div>
+      </div>
+    </div>
+
+    <!-- Config Section -->
+    <div class="section" id="section-config">
+      <div class="card">
+        <div class="card-title">Current Configuration</div>
+        <pre class="logs" id="config-display" style="max-height:400px">Loading...</pre>
+      </div>
+      <div class="card">
+        <div class="card-title">Update Config</div>
+        <div class="input-group">
+          <label>Config Patch (JSON)</label>
+          <textarea id="config-patch" placeholder='{"llm": {"model": "gpt-4"}}'></textarea>
+        </div>
+        <button class="btn primary" onclick="applyConfig()">Apply Patch</button>
+      </div>
+    </div>
+
+    <!-- Skills Section -->
+    <div class="section" id="section-skills">
+      <div class="card">
+        <div class="card-title">Installed Skills</div>
+        <div id="skills-list" style="color:#8b949e">Loading...</div>
+      </div>
+    </div>
+
+    <!-- Tools Section -->
+    <div class="section" id="section-tools">
+      <div class="card">
+        <div class="card-title">Available Tools</div>
+        <div id="tools-list" style="color:#8b949e">Loading...</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+// State
+let gatewayUrl = '';
+let ws = null;
+let bootstrap = null;
+let sessions = {};
+let startTime = Date.now();
+
+function getBaseUrl() {
+  return gatewayUrl.replace('ws://', 'http://').replace('wss://', 'https://');
+}
+
+function timeAgo(ts) {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+
+function formatUptime(ms) {
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return h > 0 ? h + 'h ' + m + 'm' : m + 'm';
+}
+
+// Navigation
+document.querySelectorAll('.nav-link').forEach(link => {
+  link.addEventListener('click', e => {
+    e.preventDefault();
+    const section = link.dataset.section;
+    document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+    document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+    link.classList.add('active');
+    document.getElementById('section-' + section).classList.add('active');
+    window.location.hash = '/' + section;
+  });
+});
+
+// Hash routing
+function handleHash() {
+  const hash = window.location.hash || '#/status';
+  const section = hash.replace('#/', '') || 'status';
+  const link = document.querySelector('.nav-link[data-section="' + section + '"]');
+  if (link) link.click();
+}
+window.addEventListener('hashchange', handleHash);
+
+// WebSocket
+function connectWs() {
+  try {
+    ws = new WebSocket(gatewayUrl);
+    ws.onopen = () => {
+      document.getElementById('ws-status').innerHTML = '<span class="ws-status connected"></span>Connected';
+      document.getElementById('ws-status').className = 'status-value ok';
+      // Send connect
+      ws.send(JSON.stringify({
+        jsonrpc: '2.0', method: 'connect',
+        params: { token: sessionStorage.getItem('gatewayToken') || '' }, id: 1
+      }));
+    };
+    ws.onmessage = evt => {
+      try {
+        const msg = JSON.parse(evt.data);
+        if (msg.method === 'hello-ok') {
+          // Connected
+        } else if (msg.method === 'sessions.changed') {
+          refreshSessions();
+        }
+      } catch (e) {}
+    };
+    ws.onclose = () => {
+      document.getElementById('ws-status').innerHTML = '<span class="ws-status disconnected"></span>Disconnected';
+      document.getElementById('ws-status').className = 'status-value error';
+      setTimeout(connectWs, 3000);
+    };
+    ws.onerror = () => ws.close();
+  } catch (e) {
+    setTimeout(connectWs, 3000);
+  }
+}
+
+function wsSend(method, params, onResult) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const id = Date.now();
+  ws.send(JSON.stringify({ jsonrpc: '2.0', method, params, id }));
+  // Simple timeout-based response handler
+  const timeout = setTimeout(() => onResult(null), 3000);
+  const origOnmessage = ws.onmessage;
+  ws.onmessage = function(evt) {
+    try {
+      const msg = JSON.parse(evt.data);
+      if (msg.id === id) {
+        clearTimeout(timeout);
+        ws.onmessage = origOnmessage;
+        onResult(msg.result);
+      }
+    } catch (e) {}
+    if (origOnmessage) origOnmessage.call(this, evt);
+  };
+}
+
+// API calls via HTTP
+async function api(method, path, body) {
+  const base = getBaseUrl();
+  const res = await fetch(base + path, {
+    method,
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (sessionStorage.getItem('gatewayToken') || '') },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  return res.json();
+}
+
+// Load bootstrap
+async function loadBootstrap() {
+  try {
+    const res = await fetch(getBaseUrl() + '/__openclaw/control-ui-config.json');
+    bootstrap = await res.json();
+    gatewayUrl = bootstrap.gatewayUrl;
+    document.getElementById('assistant-name').textContent = bootstrap.assistantName;
+    document.getElementById('agent-id').textContent = bootstrap.assistantAgentId;
+    connectWs();
+    refreshStatus();
+  } catch (e) {
+    document.getElementById('version').textContent = 'Error loading config';
+  }
+}
+
+// Refresh status
+async function refreshStatus() {
+  try {
+    const health = await fetch(getBaseUrl() + '/health').then(r => r.json());
+    document.getElementById('version').textContent = health.version || '2026.3.14';
+    document.getElementById('uptime').textContent = formatUptime(Date.now() - startTime);
+  } catch (e) {}
+  
+  try {
+    const status = await api('GET', '/api/business/project');
+    // Just check if the endpoint is reachable
+    document.getElementById('llm-provider').textContent = 'Configured';
+  } catch (e) {
+    document.getElementById('llm-provider').textContent = 'Not configured';
+  }
+  
+  // Refresh sessions
+  refreshSessions();
+  
+  // Update uptime every minute
+  setTimeout(refreshStatus, 60000);
+}
+
+async function refreshSessions() {
+  // Use sessions.list via WS
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  wsSend('sessions.list', {}, result => {
+    if (!result) return;
+    const list = result.sessions || [];
+    document.getElementById('session-count').textContent = list.length;
+    const tbody = document.getElementById('sessions-table-body');
+    if (list.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" style="color:#8b949e;text-align:center">No active sessions</td></tr>';
+      return;
+    }
+    tbody.innerHTML = list.map(s => `
+      <tr>
+        <td><code style="font-size:12px">${escapeHtml(s.sessionKey || '')}</code></td>
+        <td><span class="badge green">${escapeHtml(s.type || 'chat')}</span></td>
+        <td>${s.messageCount || 0}</td>
+        <td>${s.createdAt ? timeAgo(s.createdAt) : '—'}</td>
+        <td><button class="btn" onclick="killSession('${escapeHtml(s.sessionKey || '')}')">Kill</button></td>
+      </tr>
+    `).join('');
+  });
+}
+
+async function killSession(key) {
+  if (!confirm('Kill session ' + key + '?')) return;
+  try {
+    await api('POST', '/sessions/' + encodeURIComponent(key) + '/kill', {});
+    refreshSessions();
+  } catch (e) { alert('Failed: ' + e); }
+}
+
+async function loadTrace() {
+  const key = document.getElementById('trace-session-key').value.trim();
+  if (!key) return;
+  const output = document.getElementById('trace-output');
+  output.style.display = 'block';
+  output.textContent = 'Loading...';
+  try {
+    const base = getBaseUrl();
+    const res = await fetch(base + '/sessions/' + encodeURIComponent(key) + '/trace?limit=200', {
+      headers: { 'Authorization': 'Bearer ' + (sessionStorage.getItem('gatewayToken') || '') }
+    });
+    const data = await res.json();
+    output.textContent = JSON.stringify(data, null, 2);
+  } catch (e) { output.textContent = 'Error: ' + e; }
+}
+
+async function applyConfig() {
+  const patch = document.getElementById('config-patch').value.trim();
+  try {
+    const obj = JSON.parse(patch);
+    const result = await api('POST', '/api/config/patch', obj);
+    alert('Config updated: ' + JSON.stringify(result));
+  } catch (e) { alert('Invalid JSON: ' + e); }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// Init
+loadBootstrap();
+handleHash();
+</script>
+</body>
+</html>
