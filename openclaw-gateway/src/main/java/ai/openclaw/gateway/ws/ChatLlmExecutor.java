@@ -5,6 +5,7 @@ import ai.openclaw.agent.tools.OpenClawToolRegistry;
 import ai.openclaw.gateway.business.ProjectService;
 import ai.openclaw.gateway.business.StaffService;
 import ai.openclaw.gateway.chat.ChatRunRegistry;
+import ai.openclaw.gateway.im.ImNodeBridge;
 import ai.openclaw.gateway.sessions.InMemorySessionStore;
 import ai.openclaw.llm.OpenAiCompatibleChatClient;
 import ai.openclaw.memory.MemoryHit;
@@ -36,7 +37,17 @@ public final class ChatLlmExecutor {
   private final String lastUserMessage;
   private final String chatRunId;
   private final ChatSendLlmOptions llmOptions;
+  private final OnCompleteCallback onComplete;
 
+  /**
+   * Called after LLM response is broadcast to all subscribers (WebSocket + internal).
+   * Allows post-processing hooks like IM bridge delivery.
+   */
+  public interface OnCompleteCallback {
+    void onComplete(String sessionKey, InMemorySessionStore.SessionEntry entry);
+  }
+
+  /** Convenience factory using default OnCompleteCallback = null. */
   public static ChatLlmExecutor forSession(
       String sessionKey,
       String lastUserMessage,
@@ -48,9 +59,26 @@ public final class ChatLlmExecutor {
       SessionContextBuilder ctxBuilder,
       LlmConfigResolver configResolver,
       ChatRunRegistry chatRunRegistry) {
+    return forSession(sessionKey, lastUserMessage, llmOptions, chatRunId,
+        sessionStore, sqlMemory, toolRegistry, ctxBuilder, configResolver, chatRunRegistry, null);
+  }
+
+  /** Full factory with post-processing callback. */
+  public static ChatLlmExecutor forSession(
+      String sessionKey,
+      String lastUserMessage,
+      ChatSendLlmOptions llmOptions,
+      String chatRunId,
+      InMemorySessionStore sessionStore,
+      SqliteMemoryStore sqlMemory,
+      OpenClawToolRegistry toolRegistry,
+      SessionContextBuilder ctxBuilder,
+      LlmConfigResolver configResolver,
+      ChatRunRegistry chatRunRegistry,
+      OnCompleteCallback onComplete) {
     return new ChatLlmExecutor(
         sessionKey, lastUserMessage, llmOptions, chatRunId,
-        sessionStore, sqlMemory, toolRegistry, ctxBuilder, configResolver, chatRunRegistry);
+        sessionStore, sqlMemory, toolRegistry, ctxBuilder, configResolver, chatRunRegistry, onComplete);
   }
 
   private ChatLlmExecutor(
@@ -63,7 +91,8 @@ public final class ChatLlmExecutor {
       OpenClawToolRegistry toolRegistry,
       SessionContextBuilder ctxBuilder,
       LlmConfigResolver configResolver,
-      ChatRunRegistry chatRunRegistry) {
+      ChatRunRegistry chatRunRegistry,
+      OnCompleteCallback onComplete) {
     this.sessionKey = sessionKey;
     this.lastUserMessage = lastUserMessage;
     this.llmOptions = llmOptions != null ? llmOptions : ChatSendLlmOptions.DEFAULT;
@@ -74,6 +103,7 @@ public final class ChatLlmExecutor {
     this.ctxBuilder = ctxBuilder;
     this.configResolver = configResolver;
     this.chatRunRegistry = chatRunRegistry;
+    this.onComplete = onComplete;
   }
 
   /** Executes the full LLM pipeline; returns the assistant text. */
@@ -289,21 +319,31 @@ public final class ChatLlmExecutor {
   // ─── Response broadcast ─────────────────────────────────────────────────────
 
   private void broadcastResponse(String assistantText) {
+    InMemorySessionStore.SessionEntry entry;
     try {
-      int before = sessionStore.get(sessionKey).messages.size();
+      entry = sessionStore.get(sessionKey);
+      int before = entry.messages.size();
       sessionStore.addMessage(sessionKey, assistantText);
-      int after = sessionStore.get(sessionKey).messages.size();
+      int after = entry.messages.size();
       int messageSeq = after > before ? before + 1 : after;
 
       sessionStore.addEvent(sessionKey, "agent.turn.end",
           Map.of("ts", System.currentTimeMillis(), "chars", assistantText.length(),
               "messageSeq", messageSeq));
 
-      // Emit sessions.message event
       sessionStore.addEvent(sessionKey, "agent.message",
           Map.of("ts", System.currentTimeMillis(), "messageSeq", messageSeq,
               "text", assistantText));
-    } catch (Exception ignored) {}
+    } catch (Exception ignored) {
+      return;
+    }
+
+    // Invoke completion callback (IM bridge delivery, analytics, etc.)
+    if (onComplete != null) {
+      try {
+        onComplete.onComplete(sessionKey, entry);
+      } catch (Exception ignored) {}
+    }
   }
 
   // ─── Supporting records ─────────────────────────────────────────────────────

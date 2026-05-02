@@ -1572,6 +1572,27 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
           c.tools,
           c.toolChoice);
     };
+    // IM bridge callback: after LLM response, forward to Node gateway channel plugins
+    ai.openclaw.gateway.im.ImNodeBridge im = ai.openclaw.gateway.im.ImNodeBridge.get();
+    ai.openclaw.gateway.ws.ChatLlmExecutor.OnCompleteCallback imCallback = null;
+    if (im != null && im.isEnabled()) {
+      imCallback = (sk, entry) -> {
+        String lastMsg = !entry.messages.isEmpty()
+            ? entry.messages.get(entry.messages.size() - 1) : null;
+        if (lastMsg == null || lastMsg.isBlank()) return;
+        // sessionKey format: im-{channel}-{target}
+        if (sk.startsWith("im-")) {
+          String body = sk.substring(3);
+          int dash = body.indexOf('-');
+          if (dash > 0 && dash < body.length() - 1) {
+            String channel = body.substring(0, dash);
+            String target = body.substring(dash + 1);
+            im.sendMessage(channel, target, lastMsg, sk)
+                .exceptionally(ex -> null);
+          }
+        }
+      };
+    }
     try {
       ChatLlmExecutor.forSession(
           sessionKey,
@@ -1583,7 +1604,8 @@ public class GatewayWebSocketHandler extends TextWebSocketHandler {
           toolRegistry,
           getCtx(),
           resolver,
-          chatRunRegistry).
+          chatRunRegistry,
+          imCallback).
           execute();
     } catch (Exception e) {
       handleLlmError(
