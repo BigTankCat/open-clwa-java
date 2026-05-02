@@ -11,11 +11,13 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.util.StreamUtils;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.HandlerMapping;
 
 /**
  * Control UI HTTP server — serves the built-in admin UI.
@@ -87,14 +89,23 @@ public class ControlUiHttpController {
    */
   @GetMapping("/ui/**")
   public ResponseEntity<byte[]> serveUiStatic(
-      @PathVariable String pathParts,
+      HttpServletRequest request,
       @RequestParam(value = "raw", required = false, defaultValue = "false") boolean raw) {
-    String pathWithinStatic = pathParts;
-    if (pathWithinStatic.isEmpty() || pathWithinStatic.equals("/")) {
-      pathWithinStatic = "index.html";
+    String fullPath = (String) request.getAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE);
+    String pathWithinHandler = (String) request.getAttribute(HandlerMapping.PATH_WITHIN_HANDLER_MAPPING_ATTRIBUTE);
+    
+    String resourcePath;
+    if (pathWithinHandler != null) {
+      String base = "/ui";
+      if (pathWithinHandler.equals(base) || pathWithinHandler.equals(base + "/")) {
+        resourcePath = "index.html";
+      } else {
+        String after = pathWithinHandler.startsWith(base) ? pathWithinHandler.substring(base.length()) : pathWithinHandler;
+        resourcePath = after.startsWith("/") ? after.substring(1) : after;
+      }
+    } else {
+      resourcePath = "index.html";
     }
-
-    String resourcePath = normalizeResourcePath(pathWithinStatic);
 
     try {
       Resource resource = new ClassPathResource("static/" + resourcePath);

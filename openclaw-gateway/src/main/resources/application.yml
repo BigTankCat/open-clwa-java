@@ -1,5 +1,5 @@
 server:
-  port: ${OPENCLAW_GATEWAY_PORT:18789}
+  port: ${OPENCLAW_GATEWAY_PORT:18890}
 
 spring:
   application:
