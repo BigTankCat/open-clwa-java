@@ -381,7 +381,7 @@ function connectWs() {
     ws.onopen = () => {
       setWsStatus('connected');
       ws.send(JSON.stringify({ type: 'req', method: 'connect', id: String(Date.now()),
-        params: { role: 'operator', scopes: ['admin','read','write'], client: { id: 'control-ui', version: '1.0', platform: 'web' },
+        params: { role: 'operator', scopes: ['operator.admin','operator.read','operator.write'], client: { id: 'control-ui', version: '1.0', platform: 'web' },
           auth: { token: sessionStorage.getItem('gatewayToken') || '' } }));
     };
     ws.onmessage = evt => {
