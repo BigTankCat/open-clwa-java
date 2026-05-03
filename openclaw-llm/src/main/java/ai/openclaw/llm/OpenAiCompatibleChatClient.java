@@ -66,7 +66,7 @@ public final class OpenAiCompatibleChatClient {
 
   public OpenAiCompatibleChatClient() {
     this.httpClient =
-        HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
+        HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build();
   }
 
   public static Map<String, Object> messageToRequestMap(ChatMessage m) {
@@ -138,7 +138,7 @@ public final class OpenAiCompatibleChatClient {
     HttpRequest req =
         HttpRequest.newBuilder()
             .uri(URI.create(chatCompletionsUrl))
-            .timeout(Duration.ofSeconds(30))
+            .timeout(Duration.ofSeconds(120))
             .header("Authorization", "Bearer " + apiKey)
             .header("Content-Type", "application/json")
             .POST(HttpRequest.BodyPublishers.ofString(json, StandardCharsets.UTF_8))
