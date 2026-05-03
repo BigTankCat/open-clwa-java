@@ -20,15 +20,16 @@
       display: flex;
       align-items: center;
       gap: 24px;
+      overflow-x: auto;
     }
     .navbar-brand {
       font-size: 18px;
       font-weight: 700;
       color: #58a6ff;
       text-decoration: none;
+      flex-shrink: 0;
     }
-    .navbar-brand:hover { color: #79b8ff; }
-    .nav-links { display: flex; gap: 4px; }
+    .nav-links { display: flex; gap: 4px; flex-shrink: 0; }
     .nav-link {
       padding: 8px 12px;
       border-radius: 6px;
@@ -36,12 +37,13 @@
       text-decoration: none;
       font-size: 14px;
       transition: background 0.15s, color 0.15s;
+      white-space: nowrap;
     }
     .nav-link:hover, .nav-link.active {
       background: #21262d;
       color: #e6edf3;
     }
-    .main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+    .main { padding: 24px; max-width: 1400px; margin: 0 auto; }
     .card {
       background: #161b22;
       border: 1px solid #30363d;
@@ -54,6 +56,9 @@
       font-weight: 600;
       margin-bottom: 16px;
       color: #e6edf3;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
     }
     .status-grid {
       display: grid;
@@ -66,53 +71,35 @@
       border-radius: 8px;
       padding: 14px;
     }
-    .status-label {
-      font-size: 12px;
-      color: #8b949e;
-      margin-bottom: 4px;
-    }
-    .status-value {
-      font-size: 20px;
-      font-weight: 600;
-      color: #e6edf3;
-    }
+    .status-label { font-size: 12px; color: #8b949e; margin-bottom: 4px; }
+    .status-value { font-size: 20px; font-weight: 600; color: #e6edf3; }
     .status-value.ok { color: #3fb950; }
     .status-value.warn { color: #d29922; }
     .status-value.error { color: #f85149; }
     .btn {
-      padding: 8px 16px;
+      padding: 6px 12px;
       border-radius: 6px;
       border: 1px solid #30363d;
       background: #21262d;
       color: #e6edf3;
-      font-size: 14px;
+      font-size: 13px;
       cursor: pointer;
       transition: background 0.15s;
     }
     .btn:hover { background: #30363d; }
-    .btn.primary {
-      background: #238636;
-      border-color: #238636;
-    }
+    .btn.primary { background: #238636; border-color: #238636; }
     .btn.primary:hover { background: #2ea043; }
+    .btn.danger { background: #da3633; border-color: #da3633; }
+    .btn.danger:hover { background: #f85149; }
+    .btn-sm { padding: 4px 8px; font-size: 12px; }
     table { width: 100%; border-collapse: collapse; }
-    th, td {
-      text-align: left;
-      padding: 10px 12px;
-      border-bottom: 1px solid #30363d;
-      font-size: 14px;
-    }
+    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #30363d; font-size: 14px; }
     th { color: #8b949e; font-weight: 500; }
-    .badge {
-      display: inline-block;
-      padding: 2px 8px;
-      border-radius: 12px;
-      font-size: 12px;
-      font-weight: 500;
-    }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: 500; }
     .badge.green { background: #21262d; color: #3fb950; }
     .badge.yellow { background: #21262d; color: #d29922; }
     .badge.red { background: #21262d; color: #f85149; }
+    .badge.blue { background: #21262d; color: #58a6ff; }
     .section { display: none; }
     .section.active { display: block; }
     .logs {
@@ -127,23 +114,12 @@
       white-space: pre-wrap;
       color: #8b949e;
     }
-    .ws-status {
-      display: inline-block;
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      margin-right: 6px;
-    }
+    .ws-status { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
     .ws-status.connected { background: #3fb950; }
     .ws-status.disconnected { background: #f85149; }
     .input-group { margin-bottom: 12px; }
-    .input-group label {
-      display: block;
-      font-size: 13px;
-      color: #8b949e;
-      margin-bottom: 4px;
-    }
-    .input-group input, .input-group textarea {
+    .input-group label { display: block; font-size: 13px; color: #8b949e; margin-bottom: 4px; }
+    .input-group input, .input-group textarea, .input-group select {
       width: 100%;
       padding: 8px 12px;
       border-radius: 6px;
@@ -152,7 +128,27 @@
       color: #e6edf3;
       font-size: 14px;
     }
-    .input-group textarea { min-height: 80px; font-family: monospace; }
+    .input-group textarea { min-height: 80px; font-family: monospace; resize: vertical; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .chat-container { display: flex; flex-direction: column; height: 500px; }
+    .chat-messages { flex: 1; overflow-y: auto; border: 1px solid #30363d; border-radius: 8px; padding: 12px; background: #0d1117; }
+    .chat-message { margin-bottom: 12px; padding: 8px 12px; border-radius: 8px; max-width: 80%; }
+    .chat-message.user { background: #1f3a1f; align-self: flex-end; }
+    .chat-message.assistant { background: #1f2a3a; align-self: flex-start; }
+    .chat-message .sender { font-size: 11px; color: #8b949e; margin-bottom: 4px; }
+    .chat-message .text { font-size: 14px; line-height: 1.4; white-space: pre-wrap; }
+    .chat-input { display: flex; gap: 8px; margin-top: 12px; }
+    .chat-input input { flex: 1; padding: 10px 12px; border-radius: 6px; border: 1px solid #30363d; background: #0d1117; color: #e6edf3; font-size: 14px; }
+    .tool-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+    .tool-card { background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 14px; }
+    .tool-card .name { font-size: 15px; font-weight: 600; color: #58a6ff; margin-bottom: 6px; }
+    .tool-card .desc { font-size: 13px; color: #8b949e; line-height: 1.4; }
+    .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center; z-index: 1000; display: none; }
+    .modal-overlay.active { display: flex; }
+    .modal { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 24px; width: 480px; max-width: 90vw; }
+    .modal h3 { font-size: 18px; margin-bottom: 16px; }
+    .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+    .empty { color: #8b949e; text-align: center; padding: 24px; }
   </style>
 </head>
 <body>
@@ -161,6 +157,9 @@
     <div class="nav-links">
       <a class="nav-link active" data-section="status" href="#/status">Status</a>
       <a class="nav-link" data-section="sessions" href="#/sessions">Sessions</a>
+      <a class="nav-link" data-section="staff" href="#/staff">Roles</a>
+      <a class="nav-link" data-section="projects" href="#/projects">Projects</a>
+      <a class="nav-link" data-section="chat" href="#/chat">Chat</a>
       <a class="nav-link" data-section="config" href="#/config">Config</a>
       <a class="nav-link" data-section="skills" href="#/skills">Skills</a>
       <a class="nav-link" data-section="tools" href="#/tools">Tools</a>
@@ -173,48 +172,24 @@
       <div class="card">
         <div class="card-title">Gateway Status</div>
         <div class="status-grid">
-          <div class="status-item">
-            <div class="status-label">Version</div>
-            <div class="status-value" id="version">—</div>
-          </div>
-          <div class="status-item">
-            <div class="status-label">WebSocket</div>
-            <div class="status-value" id="ws-status"><span class="ws-status disconnected"></span>Disconnected</div>
-          </div>
-          <div class="status-item">
-            <div class="status-label">Sessions</div>
-            <div class="status-value" id="session-count">0</div>
-          </div>
-          <div class="status-item">
-            <div class="status-label">Uptime</div>
-            <div class="status-value" id="uptime">—</div>
-          </div>
+          <div class="status-item"><div class="status-label">Version</div><div class="status-value" id="version">—</div></div>
+          <div class="status-item"><div class="status-label">WebSocket</div><div class="status-value" id="ws-status"><span class="ws-status disconnected"></span>Disconnected</div></div>
+          <div class="status-item"><div class="status-label">Sessions</div><div class="status-value" id="session-count">0</div></div>
+          <div class="status-item"><div class="status-label">Uptime</div><div class="status-value" id="uptime">—</div></div>
         </div>
       </div>
       <div class="card">
         <div class="card-title">Assistant Identity</div>
         <div class="status-grid">
-          <div class="status-item">
-            <div class="status-label">Name</div>
-            <div class="status-value" id="assistant-name">—</div>
-          </div>
-          <div class="status-item">
-            <div class="status-label">Agent ID</div>
-            <div class="status-value" id="agent-id">—</div>
-          </div>
+          <div class="status-item"><div class="status-label">Name</div><div class="status-value" id="assistant-name">—</div></div>
+          <div class="status-item"><div class="status-label">Agent ID</div><div class="status-value" id="agent-id">—</div></div>
         </div>
       </div>
       <div class="card">
         <div class="card-title">System</div>
         <div class="status-grid">
-          <div class="status-item">
-            <div class="status-label">Memory</div>
-            <div class="status-value" id="memory-status">—</div>
-          </div>
-          <div class="status-item">
-            <div class="status-label">LLM Provider</div>
-            <div class="status-value" id="llm-provider">—</div>
-          </div>
+          <div class="status-item"><div class="status-label">Memory</div><div class="status-value" id="memory-status">—</div></div>
+          <div class="status-item"><div class="status-label">LLM Provider</div><div class="status-value" id="llm-provider">—</div></div>
         </div>
       </div>
     </div>
@@ -224,28 +199,56 @@
       <div class="card">
         <div class="card-title">Active Sessions</div>
         <table>
-          <thead>
-            <tr>
-              <th>Session Key</th>
-              <th>Type</th>
-              <th>Messages</th>
-              <th>Created</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody id="sessions-table-body">
-            <tr><td colspan="5" style="color:#8b949e;text-align:center">No active sessions</td></tr>
-          </tbody>
+          <thead><tr><th>Session Key</th><th>Type</th><th>Messages</th><th>Created</th><th>Actions</th></tr></thead>
+          <tbody id="sessions-table-body"><tr><td colspan="5" class="empty">No active sessions</td></tr></tbody>
         </table>
       </div>
       <div class="card">
         <div class="card-title">Session Trace</div>
+        <div class="input-group"><label>Session Key</label><input id="trace-session-key" type="text" placeholder="e.g. project-123@sid-abc" /></div>
+        <button class="btn" onclick="loadTrace()">Load Trace</button>
+        <pre id="trace-output" class="logs" style="margin-top:12px;display:none"></pre>
+      </div>
+    </div>
+
+    <!-- Staff (Roles) Section -->
+    <div class="section" id="section-staff">
+      <div class="card">
+        <div class="card-title">Staff / Roles <button class="btn primary btn-sm" onclick="openStaffModal()">+ Add Staff</button></div>
+        <table>
+          <thead><tr><th>ID</th><th>Name</th><th>Role</th><th>Prompt</th><th>Actions</th></tr></thead>
+          <tbody id="staff-table-body"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Projects Section -->
+    <div class="section" id="section-projects">
+      <div class="card">
+        <div class="card-title">Projects <button class="btn primary btn-sm" onclick="openProjectModal()">+ Add Project</button></div>
+        <table>
+          <thead><tr><th>ID</th><th>Name</th><th>Description</th><th>Staff</th><th>Actions</th></tr></thead>
+          <tbody id="projects-table-body"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Chat Section -->
+    <div class="section" id="section-chat">
+      <div class="card">
+        <div class="card-title">Conversation</div>
         <div class="input-group">
           <label>Session Key</label>
-          <input id="trace-session-key" type="text" placeholder="e.g. project-123@sid-abc" />
+          <input id="chat-session-key" type="text" placeholder="e.g. project-1, staff-1, im-telegram-12345" style="width:400px" />
+          <button class="btn" onclick="chatSelectSession()" style="margin-top:6px">Select / Create</button>
         </div>
-        <button class="btn" onclick="loadTrace()">Load Trace</button>
-        <div id="trace-output" class="logs" style="margin-top:12px;display:none"></div>
+        <div class="chat-container" style="margin-top:12px">
+          <div class="chat-messages" id="chat-messages"><div class="empty">Select or create a session to start chatting</div></div>
+          <div class="chat-input">
+            <input id="chat-input" type="text" placeholder="Type a message..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){chatSend();event.preventDefault()}" />
+            <button class="btn primary" onclick="chatSend()">Send</button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -269,7 +272,7 @@
     <div class="section" id="section-skills">
       <div class="card">
         <div class="card-title">Installed Skills</div>
-        <div id="skills-list" style="color:#8b949e">Loading...</div>
+        <div id="skills-list"><div class="empty">Loading...</div></div>
       </div>
     </div>
 
@@ -277,23 +280,53 @@
     <div class="section" id="section-tools">
       <div class="card">
         <div class="card-title">Available Tools</div>
-        <div id="tools-list" style="color:#8b949e">Loading...</div>
+        <div id="tools-list"><div class="empty">Loading...</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Staff Modal -->
+  <div class="modal-overlay" id="staff-modal">
+    <div class="modal">
+      <h3 id="staff-modal-title">Add Staff</h3>
+      <input type="hidden" id="staff-id" />
+      <div class="input-group"><label>Name</label><input id="staff-name" type="text" placeholder="e.g. 张三" /></div>
+      <div class="input-group"><label>Role</label><select id="staff-role"><option value="pm">PM</option><option value="dev">Dev</option><option value="qa">QA</option></select></div>
+      <div class="input-group"><label>Prompt</label><textarea id="staff-prompt" placeholder="System prompt for this staff member..."></textarea></div>
+      <div class="modal-actions">
+        <button class="btn" onclick="closeStaffModal()">Cancel</button>
+        <button class="btn primary" onclick="saveStaff()">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Project Modal -->
+  <div class="modal-overlay" id="project-modal">
+    <div class="modal">
+      <h3 id="project-modal-title">Add Project</h3>
+      <input type="hidden" id="project-id" />
+      <div class="input-group"><label>Name</label><input id="project-name" type="text" placeholder="e.g. Relax Games" /></div>
+      <div class="input-group"><label>Description</label><textarea id="project-desc" placeholder="Project description..."></textarea></div>
+      <div class="input-group"><label>Staff IDs (comma-separated)</label><input id="project-staff" type="text" placeholder="e.g. 1,2,3" /></div>
+      <div class="modal-actions">
+        <button class="btn" onclick="closeProjectModal()">Cancel</button>
+        <button class="btn primary" onclick="saveProject()">Save</button>
       </div>
     </div>
   </div>
 
 <script>
-// State
+// ─── State ─────────────────────────────────────────────────────────────────────
 let gatewayUrl = '';
 let ws = null;
 let bootstrap = null;
-let sessions = {};
+let currentChatSession = null;
 let startTime = Date.now();
 
+// ─── Init ──────────────────────────────────────────────────────────────────────
 function getBaseUrl() {
   return gatewayUrl.replace('ws://', 'http://').replace('wss://', 'https://');
 }
-
 function timeAgo(ts) {
   const s = Math.floor((Date.now() - ts) / 1000);
   if (s < 60) return s + 's ago';
@@ -301,15 +334,17 @@ function timeAgo(ts) {
   if (s < 86400) return Math.floor(s / 3600) + 'h ago';
   return Math.floor(s / 86400) + 'd ago';
 }
-
 function formatUptime(ms) {
   const s = Math.floor(ms / 1000);
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   return h > 0 ? h + 'h ' + m + 'm' : m + 'm';
 }
+function escapeHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
 
-// Navigation
+// ─── Navigation ───────────────────────────────────────────────────────────────
 document.querySelectorAll('.nav-link').forEach(link => {
   link.addEventListener('click', e => {
     e.preventDefault();
@@ -319,73 +354,84 @@ document.querySelectorAll('.nav-link').forEach(link => {
     link.classList.add('active');
     document.getElementById('section-' + section).classList.add('active');
     window.location.hash = '/' + section;
+    // Load section data
+    if (section === 'staff') loadStaff();
+    if (section === 'projects') loadProjects();
+    if (section === 'skills') loadSkills();
+    if (section === 'tools') loadTools();
   });
 });
-
-// Hash routing
 function handleHash() {
   const hash = window.location.hash || '#/status';
   const section = hash.replace('#/', '') || 'status';
   const link = document.querySelector('.nav-link[data-section="' + section + '"]');
   if (link) link.click();
+  else if (section === 'staff') { document.querySelector('[data-section="staff"]').click(); }
+  else if (section === 'projects') { document.querySelector('[data-section="projects"]').click(); }
+  else if (section === 'chat') { document.querySelector('[data-section="chat"]').click(); }
+  else if (section === 'skills') { document.querySelector('[data-section="skills"]').click(); }
+  else if (section === 'tools') { document.querySelector('[data-section="tools"]').click(); }
 }
 window.addEventListener('hashchange', handleHash);
 
-// WebSocket
+// ─── WebSocket ────────────────────────────────────────────────────────────────
 function connectWs() {
   try {
     ws = new WebSocket(gatewayUrl);
     ws.onopen = () => {
-      document.getElementById('ws-status').innerHTML = '<span class="ws-status connected"></span>Connected';
-      document.getElementById('ws-status').className = 'status-value ok';
-      // Send connect
-      ws.send(JSON.stringify({
-        jsonrpc: '2.0', method: 'connect',
-        params: { token: sessionStorage.getItem('gatewayToken') || '' }, id: 1
-      }));
+      setWsStatus('connected');
+      ws.send(JSON.stringify({ type: 'req', method: 'connect', id: String(Date.now()),
+        params: { role: 'operator', scopes: ['admin','read','write'], client: { id: 'control-ui', version: '1.0', platform: 'web' },
+          auth: { token: sessionStorage.getItem('gatewayToken') || '' } }));
     };
     ws.onmessage = evt => {
       try {
         const msg = JSON.parse(evt.data);
-        if (msg.method === 'hello-ok') {
-          // Connected
-        } else if (msg.method === 'sessions.changed') {
-          refreshSessions();
+        if (msg.type === 'res' && msg.id === 'connect') {
+          if (msg.ok) loadBootstrap();
+        } else if (msg.type === 'evt' && msg.event === 'sessions.changed') {
+          if (document.getElementById('section-sessions').classList.contains('active')) refreshSessions();
+        } else if (msg.type === 'evt' && msg.event === 'sessions.message') {
+          if (currentChatSession && msg.payload && msg.payload.sessionKey === currentChatSession) {
+            appendChatMessage(msg.payload.sender || 'assistant', msg.payload.text || '', 'assistant');
+          }
         }
       } catch (e) {}
     };
-    ws.onclose = () => {
-      document.getElementById('ws-status').innerHTML = '<span class="ws-status disconnected"></span>Disconnected';
-      document.getElementById('ws-status').className = 'status-value error';
-      setTimeout(connectWs, 3000);
-    };
+    ws.onclose = () => { setWsStatus('disconnected'); setTimeout(connectWs, 3000); };
     ws.onerror = () => ws.close();
-  } catch (e) {
-    setTimeout(connectWs, 3000);
+  } catch (e) { setTimeout(connectWs, 3000); }
+}
+function setWsStatus(state) {
+  const el = document.getElementById('ws-status');
+  if (state === 'connected') {
+    el.innerHTML = '<span class="ws-status connected"></span>Connected';
+    el.className = 'status-value ok';
+  } else {
+    el.innerHTML = '<span class="ws-status disconnected"></span>Disconnected';
+    el.className = 'status-value error';
   }
 }
-
-function wsSend(method, params, onResult) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const id = Date.now();
-  ws.send(JSON.stringify({ jsonrpc: '2.0', method, params, id }));
-  // Simple timeout-based response handler
-  const timeout = setTimeout(() => onResult(null), 3000);
-  const origOnmessage = ws.onmessage;
-  ws.onmessage = function(evt) {
-    try {
-      const msg = JSON.parse(evt.data);
-      if (msg.id === id) {
-        clearTimeout(timeout);
-        ws.onmessage = origOnmessage;
-        onResult(msg.result);
-      }
-    } catch (e) {}
-    if (origOnmessage) origOnmessage.call(this, evt);
-  };
+function wsSend(method, params, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) { reject(new Error('WS not connected')); return; }
+    const id = String(Date.now()) + Math.random();
+    ws.send(JSON.stringify({ type: 'req', method, id, params }));
+    const timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+    ws.addEventListener('message', function handler(evt) {
+      try {
+        const msg = JSON.parse(evt.data);
+        if (msg.type === 'res' && msg.id === id) {
+          clearTimeout(timer);
+          ws.removeEventListener('message', handler);
+          resolve(msg);
+        }
+      } catch (e) {}
+    });
+  });
 }
 
-// API calls via HTTP
+// ─── HTTP helper ──────────────────────────────────────────────────────────────
 async function api(method, path, body) {
   const base = getBaseUrl();
   const res = await fetch(base + path, {
@@ -396,92 +442,235 @@ async function api(method, path, body) {
   return res.json();
 }
 
-// Load bootstrap
+// ─── Bootstrap ────────────────────────────────────────────────────────────────
 async function loadBootstrap() {
   try {
     const res = await fetch(getBaseUrl() + '/__openclaw/control-ui-config.json');
     bootstrap = await res.json();
-    gatewayUrl = bootstrap.gatewayUrl;
-    document.getElementById('assistant-name').textContent = bootstrap.assistantName;
-    document.getElementById('agent-id').textContent = bootstrap.assistantAgentId;
-    connectWs();
+    document.getElementById('assistant-name').textContent = bootstrap.assistantName || 'OpenClaw';
+    document.getElementById('agent-id').textContent = bootstrap.assistantAgentId || '—';
     refreshStatus();
-  } catch (e) {
-    document.getElementById('version').textContent = 'Error loading config';
-  }
+    refreshSessions();
+  } catch (e) { document.getElementById('version').textContent = 'Error loading config'; }
 }
 
-// Refresh status
+// ─── Status ──────────────────────────────────────────────────────────────────
 async function refreshStatus() {
   try {
     const health = await fetch(getBaseUrl() + '/health').then(r => r.json());
     document.getElementById('version').textContent = health.version || '2026.3.14';
     document.getElementById('uptime').textContent = formatUptime(Date.now() - startTime);
   } catch (e) {}
-  
   try {
-    const status = await api('GET', '/api/business/project');
-    // Just check if the endpoint is reachable
+    await api('GET', '/api/business/staff');
     document.getElementById('llm-provider').textContent = 'Configured';
-  } catch (e) {
-    document.getElementById('llm-provider').textContent = 'Not configured';
-  }
-  
-  // Refresh sessions
-  refreshSessions();
-  
-  // Update uptime every minute
+  } catch (e) { document.getElementById('llm-provider').textContent = 'Not configured'; }
   setTimeout(refreshStatus, 60000);
 }
 
+// ─── Sessions ─────────────────────────────────────────────────────────────────
 async function refreshSessions() {
-  // Use sessions.list via WS
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  wsSend('sessions.list', {}, result => {
-    if (!result) return;
-    const list = result.sessions || [];
+  try {
+    const res = await wsSend('sessions.list', {});
+    const list = res?.payload?.sessions || [];
     document.getElementById('session-count').textContent = list.length;
     const tbody = document.getElementById('sessions-table-body');
-    if (list.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="5" style="color:#8b949e;text-align:center">No active sessions</td></tr>';
-      return;
-    }
-    tbody.innerHTML = list.map(s => `
-      <tr>
-        <td><code style="font-size:12px">${escapeHtml(s.sessionKey || '')}</code></td>
-        <td><span class="badge green">${escapeHtml(s.type || 'chat')}</span></td>
-        <td>${s.messageCount || 0}</td>
-        <td>${s.createdAt ? timeAgo(s.createdAt) : '—'}</td>
-        <td><button class="btn" onclick="killSession('${escapeHtml(s.sessionKey || '')}')">Kill</button></td>
-      </tr>
-    `).join('');
-  });
+    if (!list.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty">No active sessions</td></tr>'; return; }
+    tbody.innerHTML = list.map(s => `<tr>
+      <td><code style="font-size:12px">${escapeHtml(s.sessionKey || '')}</code></td>
+      <td><span class="badge green">${escapeHtml(s.type || 'chat')}</span></td>
+      <td>${s.messageCount || 0}</td>
+      <td>${s.createdAt ? timeAgo(s.createdAt) : '—'}</td>
+      <td><button class="btn btn-sm" onclick="killSession('${escapeHtml(s.sessionKey || '')}')">Kill</button></td>
+    </tr>`).join('');
+  } catch (e) {}
 }
-
 async function killSession(key) {
   if (!confirm('Kill session ' + key + '?')) return;
-  try {
-    await api('POST', '/sessions/' + encodeURIComponent(key) + '/kill', {});
-    refreshSessions();
-  } catch (e) { alert('Failed: ' + e); }
+  try { await api('POST', '/sessions/' + encodeURIComponent(key) + '/kill', {}); refreshSessions(); } catch (e) { alert('Failed'); }
 }
-
 async function loadTrace() {
   const key = document.getElementById('trace-session-key').value.trim();
   if (!key) return;
-  const output = document.getElementById('trace-output');
-  output.style.display = 'block';
-  output.textContent = 'Loading...';
+  const out = document.getElementById('trace-output');
+  out.style.display = 'block'; out.textContent = 'Loading...';
   try {
-    const base = getBaseUrl();
-    const res = await fetch(base + '/sessions/' + encodeURIComponent(key) + '/trace?limit=200', {
-      headers: { 'Authorization': 'Bearer ' + (sessionStorage.getItem('gatewayToken') || '') }
-    });
-    const data = await res.json();
-    output.textContent = JSON.stringify(data, null, 2);
-  } catch (e) { output.textContent = 'Error: ' + e; }
+    const res = await fetch(getBaseUrl() + '/sessions/' + encodeURIComponent(key) + '/trace?limit=200',
+      { headers: { 'Authorization': 'Bearer ' + (sessionStorage.getItem('gatewayToken') || '') } });
+    out.textContent = JSON.stringify(await res.json(), null, 2);
+  } catch (e) { out.textContent = 'Error: ' + e; }
 }
 
+// ─── Staff (Roles) ────────────────────────────────────────────────────────────
+async function loadStaff() {
+  try {
+    const res = await api('GET', '/api/business/staff');
+    const list = res?.staff || [];
+    const tbody = document.getElementById('staff-table-body');
+    if (!list.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty">No staff members yet</td></tr>'; return; }
+    tbody.innerHTML = list.map(s => `<tr>
+      <td>${s.id}</td>
+      <td>${escapeHtml(s.name || '')}</td>
+      <td><span class="badge blue">${escapeHtml(s.role || '')}</span></td>
+      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(s.prompt || '')}</td>
+      <td>
+        <button class="btn btn-sm" onclick="editStaff(${s.id},'${escapeHtml(s.name||'')}','${escapeHtml(s.role||'')}','${escapeHtml(s.prompt||'')}')">Edit</button>
+        <button class="btn btn-sm danger" onclick="deleteStaff(${s.id})">Delete</button>
+      </td>
+    </tr>`).join('');
+  } catch (e) { document.getElementById('staff-table-body').innerHTML = '<tr><td colspan="5" class="empty">Failed to load</td></tr>'; }
+}
+function openStaffModal(id, name, role, prompt) {
+  document.getElementById('staff-id').value = id || '';
+  document.getElementById('staff-name').value = name || '';
+  document.getElementById('staff-role').value = role || 'pm';
+  document.getElementById('staff-prompt').value = prompt || '';
+  document.getElementById('staff-modal-title').textContent = id ? 'Edit Staff' : 'Add Staff';
+  document.getElementById('staff-modal').classList.add('active');
+}
+function closeStaffModal() { document.getElementById('staff-modal').classList.remove('active'); }
+function editStaff(id, name, role, prompt) { openStaffModal(id, name, role, prompt); }
+async function saveStaff() {
+  const id = document.getElementById('staff-id').value;
+  const name = document.getElementById('staff-name').value.trim();
+  const role = document.getElementById('staff-role').value;
+  const prompt = document.getElementById('staff-prompt').value.trim();
+  if (!name) { alert('Name required'); return; }
+  try {
+    if (id) await api('POST', '/api/business/staff/' + id, { name, role, prompt });
+    else await api('POST', '/api/business/staff', { name, role, prompt });
+    closeStaffModal();
+    loadStaff();
+  } catch (e) { alert('Save failed: ' + e); }
+}
+async function deleteStaff(id) {
+  if (!confirm('Delete staff #' + id + '?')) return;
+  try { await api('DELETE', '/api/business/staff/' + id, null); loadStaff(); } catch (e) { alert('Delete failed'); }
+}
+
+// ─── Projects ────────────────────────────────────────────────────────────────
+async function loadProjects() {
+  try {
+    const res = await api('GET', '/api/business/project');
+    const list = res?.projects || [];
+    const tbody = document.getElementById('projects-table-body');
+    if (!list.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty">No projects yet</td></tr>'; return; }
+    tbody.innerHTML = list.map(p => `<tr>
+      <td>${p.id}</td>
+      <td>${escapeHtml(p.name || '')}</td>
+      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(p.description || '')}</td>
+      <td>${escapeHtml((p.staffIds || []).join(', '))}</td>
+      <td>
+        <button class="btn btn-sm" onclick="editProject(${p.id},'${escapeHtml(p.name||'')}','${escapeHtml(p.description||'')}','${(p.staffIds||[]).join(',')}')">Edit</button>
+        <button class="btn btn-sm danger" onclick="deleteProject(${p.id})">Delete</button>
+      </td>
+    </tr>`).join('');
+  } catch (e) { document.getElementById('projects-table-body').innerHTML = '<tr><td colspan="5" class="empty">Failed to load</td></tr>'; }
+}
+function openProjectModal(id, name, description, staffIds) {
+  document.getElementById('project-id').value = id || '';
+  document.getElementById('project-name').value = name || '';
+  document.getElementById('project-desc').value = description || '';
+  document.getElementById('project-staff').value = staffIds || '';
+  document.getElementById('project-modal-title').textContent = id ? 'Edit Project' : 'Add Project';
+  document.getElementById('project-modal').classList.add('active');
+}
+function closeProjectModal() { document.getElementById('project-modal').classList.remove('active'); }
+function editProject(id, name, description, staffIds) { openProjectModal(id, name, description, staffIds); }
+async function saveProject() {
+  const id = document.getElementById('project-id').value;
+  const name = document.getElementById('project-name').value.trim();
+  const description = document.getElementById('project-desc').value.trim();
+  const staffIdsRaw = document.getElementById('project-staff').value.trim();
+  const staffIds = staffIdsRaw ? staffIdsRaw.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n)) : [];
+  if (!name) { alert('Name required'); return; }
+  try {
+    if (id) await api('POST', '/api/business/project/' + id, { name, description, staffIds });
+    else await api('POST', '/api/business/project', { name, description, staffIds });
+    closeProjectModal();
+    loadProjects();
+  } catch (e) { alert('Save failed: ' + e); }
+}
+async function deleteProject(id) {
+  if (!confirm('Delete project #' + id + '?')) return;
+  try { await api('DELETE', '/api/business/project/' + id, null); loadProjects(); } catch (e) { alert('Delete failed'); }
+}
+
+// ─── Chat ─────────────────────────────────────────────────────────────────────
+async function chatSelectSession() {
+  const key = document.getElementById('chat-session-key').value.trim();
+  if (!key) { alert('Enter a session key'); return; }
+  currentChatSession = key;
+  const el = document.getElementById('chat-messages');
+  el.innerHTML = '<div class="empty">Loading...</div>';
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const res = await wsSend('chat.history', { sessionKey: key });
+      const msgs = res?.payload?.messages || [];
+      el.innerHTML = '';
+      msgs.forEach((m, i) => {
+        const sender = i % 2 === 0 ? 'user' : 'assistant';
+        appendChatMessage(sender, m, sender, true);
+      });
+      if (!msgs.length) el.innerHTML = '<div class="empty">Session empty. Send a message to start!</div>';
+    }
+  } catch (e) { el.innerHTML = '<div class="empty">Session not found or not connected</div>'; }
+}
+async function chatSend() {
+  const input = document.getElementById('chat-input');
+  const text = input.value.trim();
+  if (!text || !currentChatSession) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) { alert('Not connected to gateway'); return; }
+  appendChatMessage('user', text, 'user');
+  input.value = '';
+  try {
+    const res = await wsSend('chat.send', { sessionKey: currentChatSession, message: text }, 30000);
+    if (!res?.ok) appendChatMessage('assistant', 'Error: ' + (res?.error?.message || 'send failed'), 'assistant');
+  } catch (e) { appendChatMessage('assistant', 'Error: ' + e.message, 'assistant'); }
+}
+function appendChatMessage(sender, text, type, silent = false) {
+  const el = document.getElementById('chat-messages');
+  const div = document.createElement('div');
+  div.className = 'chat-message ' + type;
+  div.innerHTML = '<div class="sender">' + sender + '</div><div class="text">' + escapeHtml(text) + '</div>';
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+}
+
+// ─── Skills ───────────────────────────────────────────────────────────────────
+async function loadSkills() {
+  const el = document.getElementById('skills-list');
+  if (!ws || ws.readyState !== WebSocket.OPEN) { el.innerHTML = '<div class="empty">Not connected</div>'; return; }
+  try {
+    const res = await wsSend('skills.status', { agentId: bootstrap?.assistantAgentId || 'default' });
+    const data = res?.payload || {};
+    if (!Object.keys(data).length) { el.innerHTML = '<div class="empty">No skills installed</div>'; return; }
+    el.innerHTML = '<table><thead><tr><th>Name</th><th>Status</th><th>Path</th></tr></thead><tbody>' +
+      Object.entries(data).map(([name, info]) => {
+        const status = typeof info === 'object' ? (info.enabled ? 'enabled' : 'disabled') : 'unknown';
+        const path = typeof info === 'object' ? (info.path || '') : '';
+        return `<tr><td>${escapeHtml(name)}</td><td><span class="badge ${status==='enabled'?'green':'yellow'}">${status}</span></td><td style="font-size:12px;color:#8b949e">${escapeHtml(path)}</td></tr>`;
+      }).join('') + '</tbody></table>';
+  } catch (e) { el.innerHTML = '<div class="empty">Failed to load skills: ' + escapeHtml(e.message) + '</div>'; }
+}
+
+// ─── Tools ────────────────────────────────────────────────────────────────────
+async function loadTools() {
+  const el = document.getElementById('tools-list');
+  if (!ws || ws.readyState !== WebSocket.OPEN) { el.innerHTML = '<div class="empty">Not connected</div>'; return; }
+  try {
+    const res = await wsSend('status', {});
+    const tools = res?.payload?.tools || [];
+    if (!tools.length) { el.innerHTML = '<div class="empty">No tools registered</div>'; return; }
+    el.innerHTML = '<div class="tool-grid">' + tools.map(t => `<div class="tool-card">
+      <div class="name">${escapeHtml(t.name || t.toolName || 'unknown')}</div>
+      <div class="desc">${escapeHtml(t.description || t.desc || '')}</div>
+    </div>`).join('') + '</div>';
+  } catch (e) { el.innerHTML = '<div class="empty">Failed to load tools: ' + escapeHtml(e.message) + '</div>'; }
+}
+
+// ─── Config ────────────────────────────────────────────────────────────────────
 async function applyConfig() {
   const patch = document.getElementById('config-patch').value.trim();
   try {
@@ -491,12 +680,16 @@ async function applyConfig() {
   } catch (e) { alert('Invalid JSON: ' + e); }
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+// ─── Boot ─────────────────────────────────────────────────────────────────────
+async function init() {
+  try {
+    const res = await fetch(getBaseUrl() + '/__openclaw/control-ui-config.json');
+    bootstrap = await res.json();
+    gatewayUrl = bootstrap.gatewayUrl;
+    connectWs();
+  } catch (e) { document.getElementById('version').textContent = 'Cannot reach gateway'; }
 }
-
-// Init
-loadBootstrap();
+init();
 handleHash();
 </script>
 </body>
